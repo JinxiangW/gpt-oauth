@@ -1,0 +1,14 @@
+{
+  "name": "dsh-llm-openai",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./login": "./login.mjs"
+  },
+  "scripts": {
+    "vendor:proxy": "npm install --prefix vendor undici@6.21.2"
+  }
+}
