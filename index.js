@@ -146,7 +146,10 @@ function harnessApiKeyAuth(displayName) {
 // A "-fast" catalog entry maps back to its base wire model and adds
 // service_tier: "priority" to the Codex request (same behavior as opencode's
 // model options). pi-ai's streamSimple drops unknown options, so the fast path
-// builds its base options explicitly and calls stream() directly.
+// builds its base options explicitly and calls stream() directly. The emitted
+// message.model is then relabeled with the selector id, otherwise the harness
+// replay state records the wire id and a follow-up turn fails with
+// "model does not match assistant source".
 function codexWireModel(model) {
   if (typeof model?.id !== "string" || !model.id.endsWith(FAST_SUFFIX)) {
     return { model };
@@ -157,13 +160,27 @@ function codexWireModel(model) {
   };
 }
 
+async function* relabelFastModel(events, selectedModel) {
+  const wireId = selectedModel.id.slice(0, -FAST_SUFFIX.length);
+  for await (const event of events) {
+    if (event.type === "done" && event.message?.model === wireId) {
+      yield { ...event, message: { ...event.message, model: selectedModel.id } };
+    } else if (event.type === "error" && event.error?.model === wireId) {
+      yield { ...event, error: { ...event.error, model: selectedModel.id } };
+    } else {
+      yield event;
+    }
+  }
+}
+
 function codexStream(baseProvider, model, context, options) {
   const wire = codexWireModel(model);
-  return baseProvider.stream(
+  const events = baseProvider.stream(
     wire.model,
     context,
     wire.serviceTier === undefined ? options : { ...options, serviceTier: wire.serviceTier },
   );
+  return wire.serviceTier === undefined ? events : relabelFastModel(events, model);
 }
 
 function codexStreamSimple(baseProvider, model, context, options) {
@@ -174,11 +191,14 @@ function codexStreamSimple(baseProvider, model, context, options) {
   const clampedReasoning =
     options?.reasoning === undefined ? undefined : clampThinkingLevel(wire.model, options.reasoning);
   const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
-  return baseProvider.stream(wire.model, context, {
-    ...base,
-    reasoningEffort,
-    serviceTier: wire.serviceTier,
-  });
+  return relabelFastModel(
+    baseProvider.stream(wire.model, context, {
+      ...base,
+      reasoningEffort,
+      serviceTier: wire.serviceTier,
+    }),
+    model,
+  );
 }
 
 function buildPiProvider(baseProvider, connection) {
