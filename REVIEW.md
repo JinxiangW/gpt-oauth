@@ -1,5 +1,7 @@
 # dsh-llm-openai 插件 Review
 
+> 状态更新（整改工作区）：本文记录的是提交 `45e6553` 当时的审计基线，不再代表当前工作区状态。后续整改已处理可信 endpoint、安装脚本防破坏、Windows 浏览器启动、图片附件、作用域代理与 fail-closed、原子 OAuth store、只读 opencode fallback、OAuth 取消/超时、smoke 退出码、`--no-call`、device backoff 和 package metadata。最终发布状态以回归测试和新的提交为准。
+
 ## Review 范围
 
 本次 review 关注当前仓库作为 `dsh` LLM 插件时的：

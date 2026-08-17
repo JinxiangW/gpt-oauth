@@ -1,6 +1,5 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { clampThinkingLevel } from "@earendil-works/pi-ai";
 import { buildBaseOptions } from "@earendil-works/pi-ai/api/simple-options";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
@@ -19,11 +18,16 @@ import {
 import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
 import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
 import z from "@deepseek-ai/schemastery";
-import { installGlobalFetchProxy } from "./proxy.mjs";
+import { freshAccessFromOwnStore, readOAuthSource } from "./oauth-store.mjs";
+import {
+  installScopedFetchProxy,
+  proxyConfiguredFor,
+  withOpenAIProxy,
+} from "./proxy.mjs";
 
-// Make undici/openai's global fetch honor DSH_OPENAI_PROXY/HTTPS_PROXY, and
-// Windows' system proxy on win32 (Node does not read the registry proxy).
-installGlobalFetchProxy();
+// The compatibility shim is process-global because pi-ai calls global fetch,
+// but it changes behavior only inside withOpenAIProxy()'s async context.
+installScopedFetchProxy();
 
 const name = "llm-openai";
 const inject = ["llm"];
@@ -69,11 +73,30 @@ const Config = z.object({
   retryPolicy: RetryPolicySchema,
 });
 
-function resolveAdapterOptions(config) {
-  const baseURL = (config.baseURL ?? DEFAULT_BASE_URL).trim();
-  if (!/^https?:\/\//i.test(baseURL)) {
-    throw new Error(`llm-openai: baseURL must be an http(s) URL`);
+function trustedBaseURL(value = DEFAULT_BASE_URL) {
+  let url;
+  try {
+    url = new URL(value.trim());
+  } catch (error) {
+    throw new Error("llm-openai: baseURL must be the trusted ChatGPT subscription endpoint", { cause: error });
   }
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== "chatgpt.com" ||
+    url.port !== "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    url.pathname.replace(/\/+$/, "") !== "/backend-api"
+  ) {
+    throw new Error(`llm-openai: baseURL must be exactly ${DEFAULT_BASE_URL} (a custom endpoint could receive the OAuth token and conversation)`);
+  }
+  return DEFAULT_BASE_URL;
+}
+
+function resolveAdapterOptions(config) {
+  const baseURL = trustedBaseURL(config.baseURL ?? DEFAULT_BASE_URL);
   const streamIdleTimeoutMs = config.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
   if (!Number.isFinite(streamIdleTimeoutMs) || streamIdleTimeoutMs <= 0 || streamIdleTimeoutMs > MAX_TIMER_DELAY_MS) {
     throw new Error(`llm-openai: streamIdleTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`);
@@ -115,13 +138,14 @@ function fastVariant(model) {
 }
 
 function gptModelCatalog(baseURL = DEFAULT_BASE_URL) {
+  const trusted = trustedBaseURL(baseURL);
   const models = openaiCodexProvider()
     .getModels()
     .filter((model) => typeof model.id === "string" && model.id.startsWith("gpt-"))
     .map((model) =>
       alignSubscriptionThinking({
         ...model,
-        baseUrl: baseURL.replace(/\/+$/, ""),
+        baseUrl: trusted,
       }),
     );
   if (models.length === 0) {
@@ -173,32 +197,68 @@ async function* relabelFastModel(events, selectedModel) {
   }
 }
 
+function proxiedCodexOptions(options) {
+  return proxyConfiguredFor(`${DEFAULT_BASE_URL}/codex/responses`)
+    ? { ...options, transport: "sse" }
+    : options;
+}
+
+async function* inOpenAIProxyContext(createEvents) {
+  const iterator = await withOpenAIProxy(() => createEvents()[Symbol.asyncIterator]());
+  let exhausted = false;
+  try {
+    while (true) {
+      const next = await withOpenAIProxy(() => iterator.next());
+      if (next.done) {
+        exhausted = true;
+        return;
+      }
+      yield next.value;
+    }
+  } finally {
+    if (!exhausted && typeof iterator.return === "function") {
+      await withOpenAIProxy(() => iterator.return());
+    }
+  }
+}
+
 function codexStream(baseProvider, model, context, options) {
   const wire = codexWireModel(model);
-  const events = baseProvider.stream(
-    wire.model,
-    context,
-    wire.serviceTier === undefined ? options : { ...options, serviceTier: wire.serviceTier },
+  let events = inOpenAIProxyContext(() =>
+    baseProvider.stream(
+      wire.model,
+      context,
+      proxiedCodexOptions(
+        wire.serviceTier === undefined ? options : { ...options, serviceTier: wire.serviceTier },
+      ),
+    ),
   );
-  return wire.serviceTier === undefined ? events : relabelFastModel(events, model);
+  if (wire.serviceTier !== undefined) events = relabelFastModel(events, model);
+  return events;
 }
 
 function codexStreamSimple(baseProvider, model, context, options) {
   const wire = codexWireModel(model);
-  if (wire.serviceTier === undefined) return baseProvider.streamSimple(model, context, options);
-
-  const base = buildBaseOptions(wire.model, context, options, options?.apiKey);
-  const clampedReasoning =
-    options?.reasoning === undefined ? undefined : clampThinkingLevel(wire.model, options.reasoning);
-  const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
-  return relabelFastModel(
-    baseProvider.stream(wire.model, context, {
-      ...base,
-      reasoningEffort,
-      serviceTier: wire.serviceTier,
-    }),
-    model,
-  );
+  let events;
+  if (wire.serviceTier === undefined) {
+    events = inOpenAIProxyContext(() =>
+      baseProvider.streamSimple(model, context, proxiedCodexOptions(options)),
+    );
+  } else {
+    const base = buildBaseOptions(wire.model, context, options, options?.apiKey);
+    const clampedReasoning =
+      options?.reasoning === undefined ? undefined : clampThinkingLevel(wire.model, options.reasoning);
+    const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+    events = inOpenAIProxyContext(() =>
+      baseProvider.stream(wire.model, context, proxiedCodexOptions({
+        ...base,
+        reasoningEffort,
+        serviceTier: wire.serviceTier,
+      })),
+    );
+    events = relabelFastModel(events, model);
+  }
+  return events;
 }
 
 function buildPiProvider(baseProvider, connection) {
@@ -247,86 +307,10 @@ function openCodeAuthCandidates() {
   return candidates;
 }
 
-function oauthCredential(value) {
-  if (typeof value !== "object" || value === null) return undefined;
-  if (typeof value.access !== "string" || value.access.length === 0) return undefined;
-  if (typeof value.refresh !== "string" || value.refresh.length === 0) return undefined;
-  if (!Number.isFinite(value.expires)) return undefined;
-  return {
-    access: value.access,
-    refresh: value.refresh,
-    expires: value.expires,
-  };
-}
-
-async function readJson(path) {
-  try {
-    return JSON.parse(await readFile(path, "utf8"));
-  } catch (error) {
-    if (error?.code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-async function readOAuthSource(path) {
-  const doc = await readJson(path);
-  if (typeof doc !== "object" || doc === null) return undefined;
-
-  const rootEntry = doc.openai;
-  if (rootEntry !== undefined) {
-    const credential = oauthCredential(rootEntry);
-    if (credential === undefined) return undefined;
-    return { path, doc, entry: rootEntry, credential, kind: "root" };
-  }
-
-  const providersEntry = doc.providers?.openai;
-  if (providersEntry !== undefined) {
-    const credential = oauthCredential(providersEntry);
-    if (credential === undefined) return undefined;
-    return { path, doc, entry: providersEntry, credential, kind: "providers" };
-  }
-
-  const credential = oauthCredential(doc);
-  if (credential === undefined) return undefined;
-  return { path, doc, entry: doc, credential, kind: "direct" };
-}
-
-async function writeOAuthFile(path, value) {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
-}
-
-async function persistOAuthSource(source, fresh) {
-  if (source.kind === "direct") {
-    await writeOAuthFile(source.path, fresh);
-    return;
-  }
-  const updated = {
-    ...source.entry,
-    access: fresh.access,
-    refresh: fresh.refresh,
-    expires: fresh.expires,
-  };
-  if (source.kind === "providers") {
-    await writeOAuthFile(source.path, {
-      ...source.doc,
-      providers: {
-        ...source.doc.providers,
-        openai: updated,
-      },
-    });
-  } else {
-    await writeOAuthFile(source.path, {
-      ...source.doc,
-      openai: updated,
-    });
-  }
-}
-
 async function refreshOAuthToken(refreshToken) {
   let response;
   try {
-    response = await fetch(TOKEN_URL, {
+    response = await withOpenAIProxy(() => fetch(TOKEN_URL, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -334,7 +318,7 @@ async function refreshOAuthToken(refreshToken) {
         refresh_token: refreshToken,
         client_id: CLIENT_ID,
       }),
-    });
+    }));
   } catch (error) {
     throw new Error(`OpenAI subscription token refresh request failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -363,43 +347,49 @@ async function refreshOAuthToken(refreshToken) {
 
 const refreshFlights = new Map();
 
-async function freshAccessFor(source) {
-  const credential = source.credential;
-  if (credential.expires > Date.now() + TOKEN_REFRESH_SKEW_MS) return credential.access;
-
-  let flight = refreshFlights.get(source.path);
+async function freshOwnAccess(path) {
+  let flight = refreshFlights.get(path);
   if (flight === undefined) {
-    flight = (async () => {
-      const fresh = await refreshOAuthToken(credential.refresh);
-      await persistOAuthSource(source, fresh);
-      return fresh;
-    })().finally(() => refreshFlights.delete(source.path));
-    refreshFlights.set(source.path, flight);
+    flight = freshAccessFromOwnStore(path, refreshOAuthToken, TOKEN_REFRESH_SKEW_MS)
+      .finally(() => refreshFlights.delete(path));
+    refreshFlights.set(path, flight);
   }
-  const fresh = await flight;
-  return fresh.access;
+  return flight;
 }
 
 async function resolveOAuthAccessToken(logger = console) {
-  const paths = [ownOAuthPath(), ...openCodeAuthCandidates()];
-  for (const path of paths) {
+  const ownPath = ownOAuthPath();
+  let ownSource;
+  try {
+    ownSource = await readOAuthSource(ownPath);
+  } catch (error) {
+    throw new Error(`llm-openai: cannot read the selected OpenAI OAuth store ${ownPath}`, { cause: error });
+  }
+  if (ownSource !== undefined) return freshOwnAccess(ownPath);
+
+  for (const path of openCodeAuthCandidates()) {
     let source;
     try {
       source = await readOAuthSource(path);
     } catch (error) {
-      logger.warn?.(`llm-openai: cannot read OpenAI OAuth store ${path}`);
-      logger.warn?.(error);
-      continue;
+      throw new Error(`llm-openai: cannot read the selected opencode OAuth store ${path}`, { cause: error });
     }
     if (source === undefined) continue;
-    try {
-      return await freshAccessFor(source);
-    } catch (error) {
-      logger.warn?.(`llm-openai: OpenAI subscription token from ${path} could not be refreshed; trying the next source`);
-      logger.warn?.(error);
+    if (source.credential.expires <= Date.now() + TOKEN_REFRESH_SKEW_MS) {
+      throw new Error(`llm-openai: opencode OAuth credential ${path} is expired or about to expire; run dsh-openai-login so this plugin can refresh its own credential safely`);
     }
+    logger.debug?.(`llm-openai: using read-only opencode OAuth credential from ${path}`);
+    return source.credential.access;
   }
   return undefined;
+}
+
+function createDshAdapter(ctx, profiles, resolveApiKey) {
+  return new PiAiAdapter({
+    profiles,
+    resolveApiKey,
+    resolveAttachments: () => ctx.get("attachments"),
+  });
 }
 
 function apply(ctx, config) {
@@ -446,7 +436,7 @@ function apply(ctx, config) {
     );
   };
 
-  const adapter = new PiAiAdapter({ profiles, resolveApiKey });
+  const adapter = createDshAdapter(ctx, profiles, resolveApiKey);
 
   ctx.llm.registerConfigurableProviders([
     {
@@ -475,7 +465,7 @@ function apply(ctx, config) {
 
 function createSubscriptionPiProvider(baseURL = DEFAULT_BASE_URL) {
   return buildPiProvider(openaiCodexProvider(), {
-    baseURL: baseURL.replace(/\/+$/, ""),
+    baseURL: trustedBaseURL(baseURL),
   });
 }
 
@@ -486,10 +476,13 @@ export {
   NS,
   PROVIDER,
   apply,
+  createDshAdapter,
   createSubscriptionPiProvider,
   gptModelCatalog,
+  inOpenAIProxyContext,
   inject,
   name,
   resolveAdapterOptions,
   resolveOAuthAccessToken,
+  trustedBaseURL,
 };

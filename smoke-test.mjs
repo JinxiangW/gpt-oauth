@@ -2,11 +2,12 @@ import { createModels, getSupportedThinkingLevels } from "@earendil-works/pi-ai"
 
 import { createSubscriptionPiProvider, gptModelCatalog, resolveOAuthAccessToken } from "./index.js";
 
-async function main() {
-  const args = process.argv.slice(2);
+async function main(args = process.argv.slice(2), dependencies = {}) {
   const noCall = args.includes("--no-call");
   const modelFlag = args.find((arg) => arg.startsWith("--model="));
   const requestedModel = modelFlag?.slice("--model=".length) || "gpt-5.4-mini";
+  const resolveAccess = dependencies.resolveAccess ?? resolveOAuthAccessToken;
+  const createCollection = dependencies.createCollection ?? createModels;
 
   const catalog = gptModelCatalog();
   console.log(`catalog gpt models: ${catalog.length}`);
@@ -14,19 +15,18 @@ async function main() {
     console.log(`- ${model.id}: efforts=${getSupportedThinkingLevels(model).join(",")}`);
   }
 
-  const access = await resolveOAuthAccessToken(console);
+  if (noCall) {
+    console.log("SKIP_CALL");
+    return 0;
+  }
+
+  const access = await resolveAccess(console);
   if (access === undefined) {
     console.error("NO_OAUTH_TOKEN: run dsh-openai-login first");
     return 2;
   }
   console.log("oauth access token: resolved");
-
   console.log("endpoint model listing: skipped (ChatGPT subscription backend exposes models through /codex/responses, not /models)");
-
-  if (noCall) {
-    console.log("SKIP_CALL");
-    return 0;
-  }
 
   const model = catalog.find((entry) => entry.id === requestedModel);
   if (model === undefined) {
@@ -34,11 +34,12 @@ async function main() {
     return 3;
   }
 
-  const collection = createModels();
+  const collection = createCollection();
   collection.setProvider(createSubscriptionPiProvider());
   const efforts = getSupportedThinkingLevels(model);
   console.log(`wire test model: ${model.id}, efforts: ${efforts.join(",")}`);
 
+  let failures = 0;
   for (const effort of efforts) {
     const context = {
       messages: [
@@ -59,12 +60,23 @@ async function main() {
         .filter((block) => block.type === "text")
         .map((block) => block.text)
         .join("");
-      console.log(`${effort}: stop=${message.stopReason} text=${JSON.stringify(text)} error=${JSON.stringify(message.errorMessage ?? "")}`);
+      const errorMessage = message.errorMessage ?? "";
+      console.log(`${effort}: stop=${message.stopReason} text=${JSON.stringify(text)} error=${JSON.stringify(errorMessage)}`);
+      if (errorMessage.length > 0 || message.stopReason === "error" || text !== "OK") failures += 1;
     } catch (error) {
-      console.log(`${effort}: ERROR ${error instanceof Error ? error.message : String(error)}`);
+      failures += 1;
+      console.error(`${effort}: ERROR ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+  if (failures > 0) {
+    console.error(`SMOKE_FAILED: ${failures}/${efforts.length} API cases failed`);
+    return 4;
   }
   return 0;
 }
 
-process.exitCode = await main();
+if (process.argv[1]?.endsWith("smoke-test.mjs") && process.env.NODE_TEST_CONTEXT === undefined) {
+  process.exitCode = await main();
+}
+
+export { main };
