@@ -4,11 +4,15 @@ $source = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
 $profileModules = Join-Path $dshHome 'profiles\web\node_modules'
 $pluginLink = Join-Path $profileModules 'dsh-llm-openai'
+$webPluginSource = Join-Path $source 'packages\dsh-web-openai-codex'
+$webPluginLink = Join-Path $profileModules 'dsh-web-openai-codex'
+$webDependency = Join-Path $webPluginSource 'node_modules\unpdf\package.json'
 $fallback = Join-Path $dshHome 'profiles\node_modules'
 $dependencyLink = Join-Path $source 'node_modules'
 $npmBin = Join-Path $env:APPDATA 'npm'
 $loginCommand = Join-Path $npmBin 'dsh-openai-login.cmd'
 $node = (Get-Command node -ErrorAction Stop).Source
+$npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 
 if (-not (Test-Path -LiteralPath $fallback)) {
   throw "dsh fallback modules not found: $fallback (run 'dsh web --help' once first)"
@@ -36,7 +40,19 @@ function Ensure-Junction([string]$Path, [string]$Target, [string]$Label) {
   Write-Host "$Label created: $Path -> $Target"
 }
 
-Ensure-Junction $pluginLink $source 'plugin link'
+if (-not (Test-Path -LiteralPath $webPluginSource)) {
+  throw "Codex web plugin source not found: $webPluginSource"
+}
+if (-not (Test-Path -LiteralPath $webDependency)) {
+  Write-Host 'installing Codex web runtime dependencies...'
+  & $npm ci --omit=dev --legacy-peer-deps --prefix $webPluginSource
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $webDependency)) {
+    throw "Codex web dependency install failed: $webDependency"
+  }
+}
+
+Ensure-Junction $pluginLink $source 'LLM plugin link'
+Ensure-Junction $webPluginLink $webPluginSource 'Codex web plugin link'
 Ensure-Junction $dependencyLink $fallback 'dependency link'
 
 $loginScript = Join-Path $source 'login.mjs'

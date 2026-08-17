@@ -8,6 +8,7 @@ import {
   LlmError,
   RetryPolicySchema,
   assertUsableApiKey,
+  attributionHeaders,
   resolveRetryPolicy,
 } from "@deepseek-ai/dsh-llm";
 import {
@@ -38,6 +39,9 @@ const NS = settingsNamespace("llm-openai");
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api";
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300000;
+const CHATGPT_AUTH_CLAIM = "https://api.openai.com/auth";
+const CODEX_TRANSPORT_SERVICE = "openaiCodexTransport";
+const ALLOWED_CODEX_PATHS = new Set(["alpha/search"]);
 
 // Same OAuth application/endpoints used by opencode and pi-ai's bundled
 // openai-codex flow. ChatGPT-subscription tokens are not regular platform API
@@ -63,6 +67,33 @@ const FAST_MODEL_IDS = new Set([
   "gpt-5.6-terra",
 ]);
 
+const CODEX_WEB_CEILINGS = Object.freeze({
+  searchMaxResults: 50,
+  searchTimeoutMs: 120_000,
+  searchMaxOutputTokens: 16_384,
+  assistantContextTokens: 4_000,
+  fetchTimeoutMs: 120_000,
+  fetchMaxResponseBytes: 20 * 1024 * 1024,
+  fetchMaxBodyChars: 1_000_000,
+  fetchMaxRedirects: 10,
+  fetchMaxUrlLength: 8_192,
+  fetchMaxOutputChars: 1_000_000,
+});
+
+const CodexWebConfig = z.object({
+  enabled: z.boolean().default(false).description("Codex Web 总开关：开启后 web_search 使用 ChatGPT OAuth 配额并同时提供安全 web_fetch；关闭后恢复 DSH 默认搜索。"),
+  searchMaxResults: z.number().min(1).max(CODEX_WEB_CEILINGS.searchMaxResults).default(8).description("每次搜索最多返回的结构化来源数。"),
+  searchTimeoutMs: z.number().min(1).max(CODEX_WEB_CEILINGS.searchTimeoutMs).default(60_000).description("web_search 工具超时（毫秒）。"),
+  searchMaxOutputTokens: z.number().min(1).max(CODEX_WEB_CEILINGS.searchMaxOutputTokens).default(4096).description("Codex 搜索接口的最大输出 token 预算。"),
+  assistantContextTokens: z.number().min(1).max(CODEX_WEB_CEILINGS.assistantContextTokens).default(1000).description("发送给 Codex 搜索的近期助手文本预算。"),
+  fetchTimeoutMs: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchTimeoutMs).default(60_000).description("安全 web_fetch 超时（毫秒）。"),
+  fetchMaxResponseBytes: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxResponseBytes).default(5 * 1024 * 1024).description("安全 Fetch 最大响应字节数。"),
+  fetchMaxBodyChars: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxBodyChars).default(100_000).description("返回给工具层的最大正文字符数。"),
+  fetchMaxRedirects: z.number().min(0).max(CODEX_WEB_CEILINGS.fetchMaxRedirects).default(5).description("逐跳安全校验下允许的最大重定向次数。"),
+  fetchMaxUrlLength: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxUrlLength).default(2048).description("允许的最大 URL 长度。"),
+  fetchMaxOutputChars: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxOutputChars).default(200_000).description("渲染给模型的 web_fetch 最大字符数。"),
+}).description("Codex Web Search + SSRF-safe HTTP Fetch");
+
 const Config = z.object({
   baseURL: z.string().default(DEFAULT_BASE_URL),
   streamIdleTimeoutMs: z
@@ -71,6 +102,7 @@ const Config = z.object({
     .max(MAX_TIMER_DELAY_MS)
     .default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   retryPolicy: RetryPolicySchema,
+  codexWeb: CodexWebConfig.default({}),
 });
 
 function trustedBaseURL(value = DEFAULT_BASE_URL) {
@@ -106,6 +138,30 @@ function resolveAdapterOptions(config) {
     streamIdleTimeoutMs,
     retryPolicy: resolveRetryPolicy(config.retryPolicy, "llm-openai: retryPolicy"),
   };
+}
+
+function safeIntegerSetting(name, value, minimum = 1) {
+  if (!Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`llm-openai: codexWeb.${name} must be a safe integer >= ${minimum}`);
+  }
+  return value;
+}
+
+function resolveCodexWebOptions(raw = {}) {
+  const value = CodexWebConfig(raw);
+  return Object.freeze({
+    enabled: value.enabled,
+    searchMaxResults: safeIntegerSetting("searchMaxResults", value.searchMaxResults),
+    searchTimeoutMs: safeIntegerSetting("searchTimeoutMs", value.searchTimeoutMs),
+    searchMaxOutputTokens: safeIntegerSetting("searchMaxOutputTokens", value.searchMaxOutputTokens),
+    assistantContextTokens: safeIntegerSetting("assistantContextTokens", value.assistantContextTokens),
+    fetchTimeoutMs: safeIntegerSetting("fetchTimeoutMs", value.fetchTimeoutMs),
+    fetchMaxResponseBytes: safeIntegerSetting("fetchMaxResponseBytes", value.fetchMaxResponseBytes),
+    fetchMaxBodyChars: safeIntegerSetting("fetchMaxBodyChars", value.fetchMaxBodyChars),
+    fetchMaxRedirects: safeIntegerSetting("fetchMaxRedirects", value.fetchMaxRedirects, 0),
+    fetchMaxUrlLength: safeIntegerSetting("fetchMaxUrlLength", value.fetchMaxUrlLength),
+    fetchMaxOutputChars: safeIntegerSetting("fetchMaxOutputChars", value.fetchMaxOutputChars),
+  });
 }
 
 function alignSubscriptionThinking(model) {
@@ -384,6 +440,84 @@ async function resolveOAuthAccessToken(logger = console) {
   return undefined;
 }
 
+function extractChatGptAccountId(accessToken) {
+  if (typeof accessToken !== "string" || accessToken.length === 0) {
+    throw new Error("llm-openai: the ChatGPT OAuth access token is empty");
+  }
+  let payload;
+  try {
+    const parts = accessToken.split(".");
+    if (parts.length !== 3) throw new Error("not a JWT");
+    payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch (error) {
+    throw new Error("llm-openai: failed to decode the ChatGPT OAuth access token", { cause: error });
+  }
+  const accountId = payload?.[CHATGPT_AUTH_CLAIM]?.chatgpt_account_id;
+  if (typeof accountId !== "string" || accountId.length === 0) {
+    throw new Error("llm-openai: the ChatGPT OAuth access token has no chatgpt_account_id claim");
+  }
+  return accountId;
+}
+
+function validateCodexTransportRequest(request) {
+  if (typeof request !== "object" || request === null) {
+    throw new Error("llm-openai: Codex transport request must be an object");
+  }
+  const method = request.method ?? "POST";
+  if (method !== "POST") throw new Error("llm-openai: Codex transport only permits POST requests");
+  if (!ALLOWED_CODEX_PATHS.has(request.path)) {
+    throw new Error(`llm-openai: Codex transport path is not allowed: ${String(request.path)}`);
+  }
+  if (request.body === undefined) throw new Error("llm-openai: Codex transport request body is required");
+  return { method, path: request.path, body: request.body, signal: request.signal };
+}
+
+function createOpenAiCodexTransport({ resolveAccessToken, logger = console, fetcher = globalThis.fetch } = {}) {
+  if (typeof resolveAccessToken !== "function") {
+    throw new Error("llm-openai: Codex transport requires an OAuth token resolver");
+  }
+  if (typeof fetcher !== "function") throw new Error("llm-openai: Codex transport requires fetch");
+
+  return Object.freeze({
+    async request(input) {
+      const request = validateCodexTransportRequest(input);
+      const accessToken = await resolveAccessToken(logger);
+      if (accessToken === undefined) {
+        const error = new Error("llm-openai: no ChatGPT subscription credential is available; run dsh-openai-login to sign in");
+        error.code = "MISSING_CREDENTIAL";
+        throw error;
+      }
+      const accountId = extractChatGptAccountId(accessToken);
+      const endpoint = `${DEFAULT_BASE_URL}/codex/${request.path}`;
+      try {
+        return await withOpenAIProxy(() => fetcher(endpoint, {
+          method: request.method,
+          redirect: "error",
+          signal: request.signal,
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            "chatgpt-account-id": accountId,
+            originator: "dsh",
+            "content-type": "application/json",
+            accept: "application/json",
+            ...attributionHeaders(),
+          },
+          body: JSON.stringify(request.body),
+        }));
+      } catch (error) {
+        if (request.signal?.aborted) {
+          const aborted = new Error("llm-openai: Codex transport request was aborted", { cause: error });
+          aborted.code = "ABORTED";
+          throw aborted;
+        }
+        const transport = new Error(`llm-openai: Codex transport request failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        transport.code = "TRANSPORT";
+        throw transport;
+      }
+    },
+  });
+}
+
 function createDshAdapter(ctx, profiles, resolveApiKey) {
   return new PiAiAdapter({
     profiles,
@@ -413,7 +547,9 @@ function apply(ctx, config) {
       return lastGood;
     }
   };
+  const webOptions = () => resolveCodexWebOptions(current()?.codexWeb);
   options();
+  webOptions();
 
   const baseProvider = openaiCodexProvider();
   let profileCache;
@@ -435,6 +571,31 @@ function apply(ctx, config) {
       "MISSING_CREDENTIAL",
     );
   };
+
+  const codexTransport = createOpenAiCodexTransport({
+    resolveAccessToken: resolveOAuthAccessToken,
+    logger: ctx.logger,
+  });
+  const webSettingsListeners = new Set();
+  const notifyWebSettings = () => {
+    for (const listener of [...webSettingsListeners]) {
+      try {
+        listener(webOptions());
+      } catch (error) {
+        ctx.logger.warn(`llm-openai: Codex Web settings listener failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  };
+  const webSettingsService = Object.freeze({
+    get: webOptions,
+    subscribe(listener) {
+      if (typeof listener !== "function") throw new TypeError("llm-openai: Codex Web settings listener must be a function");
+      webSettingsListeners.add(listener);
+      return () => webSettingsListeners.delete(listener);
+    },
+  });
+  ctx.provide(CODEX_TRANSPORT_SERVICE, codexTransport);
+  ctx.provide("openaiCodexWebSettings", webSettingsService);
 
   const adapter = createDshAdapter(ctx, profiles, resolveApiKey);
 
@@ -459,7 +620,14 @@ function apply(ctx, config) {
     setSource: (source) => {
       current = source;
     },
-    onChange: ensureRegistrationFacts,
+    validate: (value) => {
+      resolveAdapterOptions(value);
+      resolveCodexWebOptions(value.codexWeb);
+    },
+    onChange: () => {
+      ensureRegistrationFacts();
+      notifyWebSettings();
+    },
   });
 }
 
@@ -470,6 +638,8 @@ function createSubscriptionPiProvider(baseURL = DEFAULT_BASE_URL) {
 }
 
 export {
+  CODEX_TRANSPORT_SERVICE,
+  CodexWebConfig,
   Config,
   DEFAULT_BASE_URL,
   DISPLAY_NAME,
@@ -477,12 +647,16 @@ export {
   PROVIDER,
   apply,
   createDshAdapter,
+  createOpenAiCodexTransport,
   createSubscriptionPiProvider,
+  extractChatGptAccountId,
   gptModelCatalog,
   inOpenAIProxyContext,
   inject,
   name,
   resolveAdapterOptions,
+  resolveCodexWebOptions,
   resolveOAuthAccessToken,
   trustedBaseURL,
+  validateCodexTransportRequest,
 };

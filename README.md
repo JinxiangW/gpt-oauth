@@ -3,9 +3,10 @@
 ChatGPT-subscription login and GPT model adapter for `dsh`.
 
 The plugin owns the `openai-codex` provider route (display name: **OpenAI
-(ChatGPT)**). ChatGPT OAuth credentials are sent only to
-`https://chatgpt.com/backend-api/codex/responses`, not to the regular API-key
-platform endpoint or a configurable third-party gateway.
+(ChatGPT)**). ChatGPT OAuth credentials are sent only to the fixed ChatGPT Codex
+backend (`/backend-api/codex/responses` for models and the allowlisted
+`/backend-api/codex/alpha/search` companion transport), not to the regular
+API-key platform endpoint or a configurable third-party gateway.
 
 ## What it exposes
 
@@ -42,11 +43,14 @@ all runtime and DSH peer dependencies.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\link-to-dsh.ps1
 ```
 
-The linker points the checkout at the current DSH profile dependencies and
-installs a Windows login shim. It deliberately refuses to replace any existing
-directory, unexpected link, or unrelated command. A development checkout that
-uses this junction workflow also needs `undici` available either as its normal
-package dependency or in the legacy `vendor` fallback.
+The linker points both `dsh-llm-openai` and its independent
+`dsh-web-openai-codex` companion package at the current DSH Web profile,
+connects the checkout to profile dependencies, installs the companion Web
+package's locked runtime dependencies when missing, and installs a Windows login
+shim. It deliberately refuses to replace any existing directory, unexpected
+link, or unrelated command. A development checkout that uses this junction
+workflow also needs `undici` available either as its normal package dependency
+or in the legacy `vendor` fallback.
 
 ## Login
 
@@ -61,6 +65,16 @@ token as a **read-only** fallback. It never refreshes or rewrites opencode's
 shared auth file; run `dsh-openai-login` when that fallback is near expiry.
 
 Run `dsh web` and select **OpenAI (ChatGPT)** in the model selector.
+
+## Optional Codex Web tools
+
+The independent package at `packages/dsh-web-openai-codex` consumes the
+default-off `codexWeb` group shown under the existing **llm-openai** settings
+section. Enabling its combined switch replaces `web_search` for each idle agent
+with Codex contextual search and adds the SSRF-safe `web_fetch` (including
+bounded PDF text extraction and gzip-contained text/PDF decoding); disabling it
+removes those scoped registrations so the agent inherits DSH's original search
+behavior again. See the package README for limits and security policy.
 
 ## Proxy behavior
 

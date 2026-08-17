@@ -1,0 +1,44 @@
+{
+  "name": "dsh-web-openai-codex",
+  "version": "0.1.0",
+  "description": "Toggleable Codex OAuth web search and SSRF-safe HTTP fetch for DeepSeek Harness",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./codex-search": "./lib/codex-search.js",
+    "./safe-http-fetch": "./lib/safe-http-fetch.js"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "smoke-test.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check lib/codex-search.js && node --check lib/safe-http-fetch.js && node --check lib/document-extractor-worker.js && node --check lib/tool-registration.js && node --check smoke-test.mjs",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node smoke-test.mjs --live"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tool-web": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-web": "^0.1.0-rc.6",
+    "dsh-llm-openai": ">=0.2.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JinxiangW/gpt-oauth.git",
+    "directory": "packages/dsh-web-openai-codex"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "unpdf": "^1.8.1"
+  }
+}
