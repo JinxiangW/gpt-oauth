@@ -1,5 +1,5 @@
 {
   "dependencies": {
-    "undici": "6.21.2"
+    "undici": "6.28.0"
   }
 }
