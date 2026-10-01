@@ -1,82 +1,110 @@
 # dsh-web-openai-codex
 
-Optional Codex Web Search and SSRF-safe HTTP Fetch for DeepSeek Harness. This is
-the Web Provider companion to `dsh-llm-openai`; it consumes that package's
-in-process OAuth transport and never reads or receives refresh tokens.
+Codex OAuth Search (and optional SSRF-safe Fetch) provider for the current
+DeepSeek Harness Web seam. This is the Host Web-provider companion to
+`dsh-llm-openai`; it is not a browser client plugin and never receives refresh
+tokens.
 
-## Behavior
+## Current architecture
 
-The **Codex Web** setting is a combined switch and defaults to off:
+Version 0.3 targets the `0.2.0-rc.2` Harness contracts:
 
-- Off: DSH keeps its preset-provided `web_search`; no `web_fetch` is added.
-- On: the agent-local standard `web_search` tool is shadowed by a Codex-backed
-  tool with the same schema/presentation, and the standard `web_fetch` tool is
-  added.
-- A switch requested during a running agent turn is applied when that agent next
-  becomes idle.
+- Search provider id: `openai-codex`
+- Fetch provider id: `openai-codex-safe-http` (exported, not registered)
+- Provider registry: `ctx.web`
+- Model-facing tools: `@deepseek-ai/dsh-tool-web` (the package that owns them)
+- Tool construction: `defineTool` from `@deepseek-ai/dsh-tools`, which is where
+  `0.2` moved it (it was re-exported by `dsh-tool-web` in `0.1.1`)
 
-Codex search inherits the current `openai-codex` session model, projects only the
-recent two-user-message conversation tail, and fails when the API response has no
-parseable HTTP(S) citation URLs. It never silently falls back to another model or
-provider while enabled.
+`apply()` registers the search provider only. Search therefore gains the current
+standard DSH schema, concurrent multi-query execution, formatting, structured
+errors, presentation, and lifecycle instead of maintaining a private copy of the
+tool.
 
-Safe Fetch accepts credential-free public HTTP(S) URLs only. It validates all DNS
-answers, pins the socket to the validated address, repeats validation for every
-redirect, rejects local/private/link-local/CGNAT/ULA/multicast/reserved/metadata
-targets, and sends no cookies or OAuth credentials.
+Stock DSH mounts no fetch provider, so `apply()` does not register Safe Fetch
+either; the provider factory stays exported for a composition that wants it. The
+older `createAgentWebToggle` export remains as a compatibility shim for 0.1.x
+API consumers but is no longer used by the plugin.
 
-Supported response bodies are UTF-8 text/HTML/JSON/XML, PDF text extraction, and
-one bounded `application/gzip` or `application/x-gzip` layer containing UTF-8
-text or a PDF. PDF/gzip parsing runs in a terminating worker with compressed and
-expanded byte limits, a 100-page default limit, character limits, a 100× expansion
-ratio ceiling, and a 10-second extraction deadline. Archives, nested compression,
-scanned/image-only PDFs, invalid UTF-8, and other binary formats fail explicitly.
+## Codex search
 
-## Settings
+Search runs on GPT regardless of which model the session uses:
 
-Open DSH Settings, select **llm-openai**, and edit its **codexWeb** group. DSH
-only exposes configurable model-provider namespaces to the generic settings UI,
-so the OAuth core owns this small configuration seam while all Web execution
-stays in this independent package.
+- when the session model already is `openai-codex`, search inherits that model,
+  normalizes `-fast` to the wire model, and projects a bounded recent
+  conversation tail;
+- with any other session model (for example DeepSeek), search uses the
+  configured `searchModel` and **omits the conversation entirely**, so a
+  non-Codex conversation is never uploaded to the ChatGPT backend. The built-in
+  default is still the `gpt-5.4` wire id; the desktop profile in this repository
+  sets `gpt-6-luna`.
 
-- `codexWeb.enabled` (default `false`)
-- `codexWeb.searchMaxResults` (8)
-- `codexWeb.searchTimeoutMs` (60000)
-- `codexWeb.searchMaxOutputTokens` (4096)
-- `codexWeb.assistantContextTokens` (1000)
-- `codexWeb.fetchTimeoutMs` (60000)
-- `codexWeb.fetchMaxResponseBytes` (5242880)
-- `codexWeb.fetchMaxBodyChars` (100000)
-- `codexWeb.fetchMaxRedirects` (5)
-- `codexWeb.fetchMaxUrlLength` (2048)
-- `codexWeb.fetchMaxOutputChars` (200000)
+A missing initiating agent, missing OAuth transport, unusable `searchModel`, or
+source-less response fails explicitly; it never silently falls back to another
+provider.
 
-Changing settings does not require restarting DSH after the plugin has loaded.
+The short-lived access token is resolved at execution through the allowlisted
+`openaiCodexTransport` service owned by `dsh-llm-openai`. The Web package does
+not read credentials or refresh tokens.
 
-## Composition
+## Safe Fetch
 
-Load this package on the host plane after `dsh-llm-openai`:
+Safe Fetch accepts credential-free public HTTP(S) URLs only. It validates all
+DNS answers, pins the socket to the validated address, repeats validation for
+every redirect, rejects local/private/link-local/CGNAT/ULA/multicast/reserved
+and metadata targets, and sends no cookies or OAuth credentials.
+
+Supported bodies are UTF-8 text/HTML/JSON/XML, PDF text extraction, and one
+bounded gzip layer containing UTF-8 text or PDF. Document processing runs in a
+terminating worker with byte/page/character/ratio/deadline limits. Nested
+compression, invalid UTF-8, scanned PDFs, archives, and other binary formats
+fail explicitly.
+
+## Configuration
+
+The Loader row's `config:` is the settings surface; a changed row remounts the
+plugin. `0.2` removed `settings.yaml` sections, so there is no
+`installSettingsSection` call and no separate namespace file:
 
 ```yaml
-- insert:
-    - id: web-openai-codex
-      name: dsh-web-openai-codex
+- id: web-openai-codex
+  name: dsh-web-openai-codex
+  config:
+    searchModel: gpt-6-luna
+    searchMaxOutputTokens: 4096
+    assistantContextTokens: 1000
 ```
 
-The plugin injects `agents`, `tools`, and `systemPrompt`. It resolves the
-`openaiCodexTransport` service lazily when search executes, so composition order
-does not decide whether the settings section can load; a missing OAuth package
-still fails explicitly at tool execution. It does not modify an installed DSH
-preset or `ctx.web` provider selection.
+`searchModel` is the GPT wire model used when the session model is not
+`openai-codex`; a `-fast` suffix is stripped like the session model is.
+
+Provider selection belongs to the host `web` row:
+
+```yaml
+- id: web
+  config:
+    searchProvider: openai-codex
+```
+
+## Install
+
+```powershell
+dsh plugin --profile web add dsh-llm-openai
+dsh plugin --profile web add dsh-web-openai-codex
+```
+
+The `desktop` profile is application-managed and rejects `dsh plugin --profile
+desktop`; there the bundles are declared in the profile manifest and linked as
+junctions. Restart the host after composition or plugin changes. This package has
+no `dsh.client` face and therefore does not use client-plugin HMR.
 
 ## Test
 
 ```powershell
 npm run check
 npm test
-npm run smoke   # authenticated alpha/search + public/private Fetch checks
+npm run smoke # authenticated search + public/private fetch checks
 ```
 
-The smoke command refuses network/OAuth access unless `--live` is present (the
-script used by `npm run smoke` includes it). It prints only status, source count,
-content length, and stable error codes—never tokens or complete API payloads.
+The smoke command refuses OAuth/network traffic unless `--live` is explicit.
+It never prints tokens or complete API payloads.

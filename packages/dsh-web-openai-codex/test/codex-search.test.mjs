@@ -7,6 +7,7 @@ import {
   codexWireModel,
   mapCodexSearchResponse,
   recentCodexSearchInput,
+  resolveCodexSearchModel,
 } from "../lib/codex-search.js";
 
 function message(role, blocks, source = role === "assistant" ? { kind: "model" } : role === "user" ? { kind: "user" } : { kind: "plugin" }) {
@@ -65,11 +66,56 @@ test("build request inherits and normalizes the current DSH model", () => {
   assert.equal(codexWireModel("gpt-5.4-mini"), "gpt-5.4-mini");
 });
 
-test("build request rejects unsupported current provider without fallback", () => {
+test("build request falls back to the configured GPT model for a non-Codex session", () => {
+  const request = buildCodexSearchRequest({
+    session: session({ provider: "deepseek-official", model: "deepseek-flash", messages: [text("user", "private question")] }),
+    query: " latest facts ",
+    maxResults: 6,
+    assistantContextTokens: 1000,
+    maxOutputTokens: 2048,
+    searchModel: "gpt-5.4",
+  });
+  assert.equal(request.model, "gpt-5.4");
+  assert.equal(request.commands.search_query[0].q, "latest facts");
+  assert.equal(request.commands.response_length, "medium");
+  // A non-Codex conversation must not be uploaded to the ChatGPT backend.
+  assert.equal(request.input, undefined);
+});
+
+test("build request normalizes a -fast configured search model", () => {
+  const request = buildCodexSearchRequest({
+    session: session({ provider: "deepseek-official", model: "deepseek-flash" }),
+    query: "q",
+    searchModel: "gpt-5.4-mini-fast",
+  });
+  assert.equal(request.model, "gpt-5.4-mini");
+});
+
+test("session route wins over the configured search model and keeps its context", () => {
+  const request = buildCodexSearchRequest({
+    session: session({ messages: [text("user", "codex question")] }),
+    query: "q",
+    searchModel: "gpt-5.4",
+  });
+  assert.equal(request.model, "gpt-5.6-sol");
+  assert.deepEqual(request.input, [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "codex question" }] },
+  ]);
+});
+
+test("non-Codex session without a usable search model fails explicitly", () => {
+  for (const searchModel of [undefined, "", "   ", 42, "bad model!"]) {
+    assert.throws(
+      () => resolveCodexSearchModel({ provider: "deepseek-official", model: "deepseek-flash" }, searchModel),
+      (error) => error.code === "WEB_CODEX_MODEL_UNAVAILABLE",
+      `searchModel=${String(searchModel)}`,
+    );
+  }
   assert.throws(
-    () => buildCodexSearchRequest({ session: session({ provider: "deepseek" }), query: "x" }),
-    (error) => error.code === "WEB_CODEX_PROVIDER_MISMATCH",
+    () => resolveCodexSearchModel(undefined, "   "),
+    (error) => error.code === "WEB_CODEX_MODEL_UNAVAILABLE",
   );
+  assert.equal(resolveCodexSearchModel({ provider: "deepseek-official" }, "gpt-5.6-luna-fast"), "gpt-5.6-luna");
 });
 
 test("maps only known text_result URLs, de-duplicates, and truncates", () => {
@@ -174,4 +220,25 @@ test("provider sends alpha/search request and maps response", async () => {
   assert.equal(calls[0].path, "alpha/search");
   assert.equal(calls[0].body.model, "gpt-5.6-sol");
   assert.deepEqual(result.sources, [{ url: "https://example.com/" }]);
+});
+
+test("provider searches through GPT for a DeepSeek session", async () => {
+  const calls = [];
+  const provider = new CodexSearchProvider({
+    transport: {
+      async request(call) {
+        calls.push(call);
+        return new Response(JSON.stringify({
+          output: "answer",
+          results: [{ type: "text_result", url: "https://example.com/gpt" }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    },
+    resolveOptions: () => ({ assistantContextTokens: 1000, searchMaxOutputTokens: 4096, searchModel: "gpt-5.4" }),
+  });
+  const agent = { session: session({ provider: "deepseek-official", model: "deepseek-flash", messages: [text("user", "question")] }) };
+  const result = await provider.search({ query: "question", maxResults: 8 }, undefined, agent);
+  assert.equal(calls[0].body.model, "gpt-5.4");
+  assert.equal(calls[0].body.input, undefined);
+  assert.deepEqual(result.sources, [{ url: "https://example.com/gpt" }]);
 });

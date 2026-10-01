@@ -1,99 +1,180 @@
 # dsh-llm-openai
 
-ChatGPT-subscription login and GPT model adapter for `dsh`.
+ChatGPT-subscription login and GPT model adapter for current DeepSeek Harness
+(`0.2.0-rc.2` architecture).
 
-The plugin owns the `openai-codex` provider route (display name: **OpenAI
-(ChatGPT)**). ChatGPT OAuth credentials are sent only to the fixed ChatGPT Codex
-backend (`/backend-api/codex/responses` for models and the allowlisted
-`/backend-api/codex/alpha/search` companion transport), not to the regular
-API-key platform endpoint or a configurable third-party gateway.
+The plugin owns the `openai-codex` provider route (display name **OpenAI
+(ChatGPT)**). ChatGPT OAuth credentials are sent only to the fixed ChatGPT
+Codex backend (`/backend-api/codex/responses` for models and the allowlisted
+`/backend-api/codex/alpha/search` companion transport), never to a configurable
+third-party gateway.
 
-## What it exposes
+## Models
 
-Subscription-supported GPT models (current pi-ai/opencode catalog):
+The model list follows pi-ai's installed OpenAI Codex catalog. `@earendil-works/pi-ai`
+is a **peer** dependency pinned to the `^0.87.1` line, which is the version the
+DSH `0.2.0-rc.2` runtime itself bundles; the plugin therefore shares the host's
+pi-ai instance instead of loading a second copy with its own provider contract.
+That range is what the current catalog requires:
 
-- `gpt-5.3-codex-spark`: off/low/medium/high/xhigh
-- `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`: off/low/medium/high/xhigh
-- `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`: off/low/medium/high/xhigh/max
+- GPT-6 (`gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`) first appears in pi-ai
+  `0.85.1`/`0.87.1`; `0.82.1`-`0.84.x` stop at `gpt-5.6`.
+- pi-ai `0.86` dropped `gpt-5.4` and `gpt-5.4-mini`, so those ids are gone.
+- pi-ai `0.99.x` adds `gpt-6.1-sol`, but no published DSH runtime bundles that
+  line yet, so it is deliberately not claimed here.
 
-Fast variants use the same wire model with `service_tier: priority`:
+With `0.87.1` the resolved catalog is:
 
-- `gpt-5.4-fast`, `gpt-5.4-mini-fast`, `gpt-5.5-fast`
-- `gpt-5.6-luna-fast`, `gpt-5.6-sol-fast`, `gpt-5.6-terra-fast`
+- `gpt-5.3-codex-spark`
+- `gpt-5.5`
+- `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`
+- `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`
 
-Models that advertise image input use DSH's durable attachment service.
+Models in `FAST_MODEL_IDS` also receive `-fast` selector variants: same wire model
+with `service_tier: priority` (pi-ai applies the priority cost multiplier and
+falls back to default pricing when the backend does not honor the tier).
+Image-capable models use DSH's durable attachment service. Sync `FAST_MODEL_IDS`
+in `index.js` when the pi-ai catalog changes: pi-ai exposes no per-model
+priority-tier capability.
+
+## Current DSH architecture
+
+Version 0.4 migrates the plugin to the `0.2.0-rc.2` Harness contracts:
+
+- `PiAiAdapter` receives the required durable `auth` injection.
+- OAuth grants and refresh rotation use `ctx.credentials` record
+  `llm-openai/openai-codex`, including its serialized cross-process mutation.
+- The plugin registers a ChatGPT browser/device authorization flow when
+  `ctx.authorization` is mounted.
+- A legacy `~/.dsh/openai-oauth.json` login is migrated once into
+  `~/.dsh/.credentials.yaml`. Until migration succeeds it remains a compatible
+  read fallback.
+- `0.2` replaced `settings.yaml` sections with per-Loader-entry config, so the
+  plugin no longer calls `installSettingsSection`; the entry's `config:` row is
+  the settings surface and the namespace `llm-openai/openai-codex` is reported
+  to `ctx.llm.registerConfigurableProviders` for the Models page.
+- `0.2` also moved `defineTool` to `@deepseek-ai/dsh-tools`, which is where the
+  Web package imports it.
+- `@earendil-works/pi-ai` moved from a pinned `0.82.1` dependency to the
+  `^0.87.1` peer range so the host runtime supplies the instance (see Models).
+
+The shipped `cordis.patch.yml` is a DSH profile bundle that mounts the
+`authorization` seam and the adapter. Do not configure the generic
+`llm-pi-ai` plugin's own `openai-codex` route at the same time; both would claim
+the same LLM route.
 
 ## Install
 
-### npm package or tarball
-
-After publication, or from a locally built tarball:
+Install the LLM and Web-provider bundles into a profile. `dsh plugin` forwards
+to pnpm and reconciles `dsh.profile.bundles` from the installed state:
 
 ```powershell
-npm install dsh-llm-openai
-# npm install .\dsh-llm-openai-0.2.0.tgz
+dsh plugin --profile web add dsh-llm-openai
+dsh plugin --profile web add dsh-web-openai-codex
 ```
 
-The package installs the cross-platform `dsh-openai-login` command and declares
-all runtime and DSH peer dependencies.
+The `desktop` profile is managed exclusively by the Electron application, which
+rejects `dsh plugin --profile desktop`; there the two bundles are declared in
+`~/.dsh/profiles/desktop/package.json` and linked into its `node_modules` as
+junctions to this checkout. `dsh-web-openai-codex` is always linked rather than
+copied, because a `file:` dependency is materialized as a snapshot copy and would
+go stale on every source edit.
 
-### Development checkout on Windows
+For this monorepo checkout, the second package lives under
+`packages/dsh-web-openai-codex`. A development convenience linker is also
+provided:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\link-to-dsh.ps1
 ```
 
-The linker points both `dsh-llm-openai` and its independent
-`dsh-web-openai-codex` companion package at the current DSH Web profile,
-connects the checkout to profile dependencies, installs the companion Web
-package's locked runtime dependencies when missing, and installs a Windows login
-shim. It deliberately refuses to replace any existing directory, unexpected
-link, or unrelated command. A development checkout that uses this junction
-workflow also needs `undici` available either as its normal package dependency
-or in the legacy `vendor` fallback.
+After changing a Host plugin or profile composition, restart `dsh web`. These
+packages do not ship a browser client bundle, so the DSH client-plugin HMR
+watcher is not involved.
 
 ## Login
 
 ```powershell
-dsh-openai-login          # browser login
+dsh-openai-login          # browser callback login
 dsh-openai-login --device # device-code login
 ```
 
-Credentials are stored atomically in `~/.dsh/openai-oauth.json`. If opencode is
-already logged in with ChatGPT, the plugin may use a still-valid opencode access
-token as a **read-only** fallback. It never refreshes or rewrites opencode's
-shared auth file; run `dsh-openai-login` when that fallback is near expiry.
+The standalone command writes the plugin-owned grant record directly to
+`~/.dsh/.credentials.yaml`. OAuth refreshes happen through DSH's per-record
+mutation lock. A pre-0.3 `~/.dsh/openai-oauth.json` file is still imported once
+and removed during plugin activation.
 
-Run `dsh web` and select **OpenAI (ChatGPT)** in the model selector.
+The registered `ctx.authorization` flow uses the same browser and device
+protocols for surfaces that expose the authorization seam. Current stock DSH
+`0.2.0-rc.2` exposes API-key reference editing but does not yet expose grant
+records over its public browser RPC, so `dsh-openai-login` remains the supported
+Web-profile login entry point.
 
-## Optional Codex Web tools
+## Codex Web companion
 
-The independent package at `packages/dsh-web-openai-codex` consumes the
-default-off `codexWeb` group shown under the existing **llm-openai** settings
-section. Enabling its combined switch replaces `web_search` for each idle agent
-with Codex contextual search and adds the SSRF-safe `web_fetch` (including
-bounded PDF text extraction and gzip-contained text/PDF decoding); disabling it
-removes those scoped registrations so the agent inherits DSH's original search
-behavior again. See the package README for limits and security policy.
+`dsh-web-openai-codex` follows the standard Web architecture:
+
+- registers search provider `openai-codex` on `ctx.web`;
+- lets `@deepseek-ai/dsh-tool-web` own model-facing schemas, formatting,
+  multi-query execution, and presentation;
+- obtains only the short-lived access token through the LLM plugin's in-process
+  allowlisted transport; refresh tokens never reach the Web package.
+
+Its bundle selects the search provider in the host `web` service. Search works
+for any session model: on an `openai-codex` session it inherits the session model
+and a bounded conversation tail, while on any other session model it uses the
+configured `searchModel` (default `gpt-5.4`) and sends the query alone, so a
+non-GPT conversation is never uploaded to the ChatGPT backend. On a pi-ai
+`0.86`+ catalog `gpt-5.4` is no longer a chat model, but it remains a valid
+alpha/search wire id; set `searchModel: gpt-6-luna` to use the current
+generation (see Enable GPT web search in a profile).
+
+The package still exports `createSafeHttpFetchProvider` (SSRF-safe Fetch:
+validates DNS and every redirect, pins the validated address, blocks private and
+metadata ranges, sends no ambient credentials, and bounds text/PDF/gzip work).
+It is deliberately not registered by `apply()`: stock DSH mounts no fetch
+provider, so enabling it is a separate composition decision.
+
+## Enable GPT web search in a profile
+
+Search is a host `web`-row selection, so a profile needs both bundles and one
+config row. The `desktop` profile (the Electron app) uses junctions to this
+checkout plus this patch layer:
+
+```yaml
+# ~/.dsh/profiles/desktop/cordis.patch.yml
+- id: web
+  config:
+    searchProvider: openai-codex
+
+- id: web-openai-codex
+  name: dsh-web-openai-codex
+  config:
+    searchModel: gpt-6-luna
+```
+
+`searchModel` only decides the wire model when the session model is not
+`openai-codex`; a `-fast` suffix is accepted and stripped. Restart the
+application after changing the composition, then confirm the loaded rows in the
+Settings plugin inventory and run one `web_search`.
 
 ## Proxy behavior
 
 The plugin reads `DSH_OPENAI_PROXY`, `OPENAI_PROXY`, standard HTTP(S) proxy
 environment variables, `NO_PROXY`, and Windows WinINet proxy settings. Proxying
-is scoped to this plugin's OAuth and Codex requests; it does not route unrelated
-DSH fetches. Invalid explicit proxy configuration fails closed instead of
-silently connecting directly. When a proxy is active, Codex uses SSE so a
-WebSocket cannot bypass the proxy.
+is scoped to OpenAI OAuth and Codex requests. Invalid explicit proxy settings
+fail closed. When a proxy is active, model transport uses SSE so a WebSocket
+cannot bypass it.
 
-## Test
+## Verify
 
 ```powershell
 npm run check
-npm test                                  # offline regression suite
-node .\smoke-test.mjs --no-call           # catalog only; no credential/network
-node .\smoke-test.mjs                     # real API: gpt-5.4-mini, all efforts
-node .\smoke-test.mjs --model=gpt-5.6-luna
+npm test
+node .\smoke-test.mjs --no-call
+node .\smoke-test.mjs --model=gpt-5.6-luna # authenticated network smoke
 ```
 
-A requested API case that throws or returns an error makes the smoke test exit
-nonzero.
+The offline suites cover OAuth record adaptation, callback cancellation,
+security boundaries, model transport, DSH adapter behavior, standard Web
+provider mapping, DNS pinning, PDF/gzip bounds, and legacy API compatibility.

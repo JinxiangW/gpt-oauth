@@ -5,7 +5,6 @@ import {
   Config,
   createOpenAiCodexTransport,
   extractChatGptAccountId,
-  resolveCodexWebOptions,
   validateCodexTransportRequest,
 } from "../index.js";
 
@@ -19,19 +18,10 @@ const TOKEN = jwt({
   "https://api.openai.com/auth": { chatgpt_account_id: "acct-test" },
 });
 
-test("llm-openai exposes default-off Codex Web settings with validated limits", () => {
-  const resolved = resolveCodexWebOptions(Config({}).codexWeb);
-  assert.equal(resolved.enabled, false);
-  assert.equal(resolved.searchMaxResults, 8);
-  assert.equal(resolved.fetchMaxResponseBytes, 5 * 1024 * 1024);
-  assert.throws(
-    () => resolveCodexWebOptions({ ...resolved, fetchMaxRedirects: 1.5 }),
-    /safe integer/,
-  );
-  assert.throws(
-    () => resolveCodexWebOptions({ ...resolved, fetchMaxResponseBytes: 20 * 1024 * 1024 + 1 }),
-    /less than or equal to|<=/,
-  );
+test("llm-openai settings stay scoped to the LLM adapter", () => {
+  const resolved = Config({});
+  assert.equal(resolved.baseURL, "https://chatgpt.com/backend-api");
+  assert.equal("codexWeb" in resolved, false);
 });
 
 test("extractChatGptAccountId accepts only a valid account claim", () => {

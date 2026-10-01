@@ -2,10 +2,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { saveOAuthCredentials } from "./oauth-store.mjs";
 import { installScopedFetchProxy, withOpenAIProxy } from "./proxy.mjs";
 
 installScopedFetchProxy();
@@ -27,16 +25,6 @@ const SLOW_DOWN_INCREMENT_SECONDS = 5;
 
 const CALLBACK_PORT = 1455;
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
-
-function dshHome() {
-  const fromEnv = process.env.DSH_HOME;
-  if (fromEnv !== undefined && fromEnv.trim().length > 0) return join(fromEnv.trim());
-  return join(homedir(), ".dsh");
-}
-
-function oauthFile() {
-  return join(dshHome(), "openai-oauth.json");
-}
 
 function generatePkce() {
   const verifier = randomBytes(32).toString("base64url");
@@ -106,10 +94,16 @@ function errorHtml(message) {
 function startCallbackServer(state, options = {}) {
   const port = options.port ?? CALLBACK_PORT;
   const timeoutMs = options.timeoutMs ?? CALLBACK_TIMEOUT_MS;
+  const signal = options.signal;
   let listening = false;
   let settled = false;
   let settleWait;
   let timer;
+  const aborted = () => {
+    const error = new Error("OpenAI OAuth login was cancelled", { cause: signal?.reason });
+    error.code = "ABORTED";
+    return error;
+  };
   const waitForCode = new Promise((resolveWait) => {
     settleWait = resolveWait;
   });
@@ -117,8 +111,12 @@ function startCallbackServer(state, options = {}) {
     if (settled) return;
     settled = true;
     if (timer !== undefined) clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
     settleWait(result);
   };
+  const onAbort = () => settle({ error: aborted() });
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
 
   const server = createServer((req, res) => {
     const send = (status, body) => {
@@ -205,7 +203,7 @@ async function readTokenResponse(response, operation) {
   };
 }
 
-async function exchangeAuthorizationCode(code, verifier, redirectUri) {
+async function exchangeAuthorizationCode(code, verifier, redirectUri, signal) {
   const response = await withOpenAIProxy(() => fetch(TOKEN_URL, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -216,21 +214,26 @@ async function exchangeAuthorizationCode(code, verifier, redirectUri) {
       code_verifier: verifier,
       redirect_uri: redirectUri,
     }),
+    signal,
   }));
   return readTokenResponse(response, "exchange");
 }
 
-async function browserLogin() {
+async function browserLogin(options = {}) {
   const { verifier, challenge } = generatePkce();
   const state = createState();
   const url = authorizationUrl(challenge, state);
-  const controller = await startCallbackServer(state);
+  const controller = await startCallbackServer(state, { signal: options.signal });
 
   let result;
   try {
-    console.log("Opening OpenAI login in your browser...\n");
-    console.log(`If the browser does not open, visit:\n${url}\n`);
-    openBrowser(url);
+    const message = "Complete OpenAI sign-in in your browser.";
+    options.notify?.({ message, url });
+    if (options.notify === undefined) {
+      console.log("Opening OpenAI login in your browser...\n");
+      console.log(`If the browser does not open, visit:\n${url}\n`);
+    }
+    if (options.openBrowser !== false) openBrowser(url);
     result = await controller.waitForCode;
   } finally {
     await controller.close();
@@ -246,7 +249,7 @@ async function browserLogin() {
   if (typeof result?.code !== "string" || result.code.length === 0) {
     throw new Error("OAuth callback did not provide an authorization code");
   }
-  return exchangeAuthorizationCode(result.code, verifier, REDIRECT_URI);
+  return exchangeAuthorizationCode(result.code, verifier, REDIRECT_URI, options.signal);
 }
 
 function normalizeDeviceInterval(value) {
@@ -255,11 +258,12 @@ function normalizeDeviceInterval(value) {
   return Math.max(MIN_DEVICE_POLL_SECONDS, interval);
 }
 
-async function startDeviceAuth() {
+async function startDeviceAuth(signal) {
   const response = await withOpenAIProxy(() => fetch(DEVICE_USER_CODE_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ client_id: CLIENT_ID }),
+    signal,
   }));
   if (!response.ok) {
     const body = await response.text().catch(() => "");
@@ -283,11 +287,23 @@ async function startDeviceAuth() {
   };
 }
 
-function delay(ms) {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+function delay(ms, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("cancelled"));
+  return new Promise((resolveDelay, rejectDelay) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener("abort", abort);
+      resolveDelay();
+    }
+    function abort() {
+      clearTimeout(timer);
+      rejectDelay(signal.reason ?? new Error("cancelled"));
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
-async function pollDeviceAuth(device) {
+async function pollDeviceAuth(device, signal) {
   const deadline = Date.now() + DEVICE_CODE_TIMEOUT_SECONDS * 1000;
   let intervalSeconds = Math.max(MIN_DEVICE_POLL_SECONDS, device.intervalSeconds);
   while (Date.now() < deadline) {
@@ -298,6 +314,7 @@ async function pollDeviceAuth(device) {
         device_auth_id: device.deviceAuthId,
         user_code: device.userCode,
       }),
+      signal,
     }));
     if (response.ok) {
       const payload = await response.json();
@@ -316,7 +333,7 @@ async function pollDeviceAuth(device) {
     }
 
     if (response.status === 403 || response.status === 404) {
-      await delay(intervalSeconds * 1000);
+      await delay(intervalSeconds * 1000, signal);
       continue;
     }
     const body = await response.text().catch(() => "");
@@ -329,11 +346,11 @@ async function pollDeviceAuth(device) {
     }
     if (errorCode === "slow_down") {
       intervalSeconds += SLOW_DOWN_INCREMENT_SECONDS;
-      await delay(intervalSeconds * 1000);
+      await delay(intervalSeconds * 1000, signal);
       continue;
     }
     if (errorCode === "deviceauth_authorization_pending") {
-      await delay(intervalSeconds * 1000);
+      await delay(intervalSeconds * 1000, signal);
       continue;
     }
     throw new Error(`OpenAI device auth failed (HTTP ${response.status}): ${body.slice(0, 400)}`);
@@ -341,17 +358,25 @@ async function pollDeviceAuth(device) {
   throw new Error("OpenAI device-code login timed out");
 }
 
-async function deviceLogin() {
-  const device = await startDeviceAuth();
-  console.log(`Open a browser and enter this code: ${device.userCode}\n`);
-  console.log(`Verification URL: ${DEVICE_VERIFICATION_URI}\n`);
-  console.log("Waiting for approval...");
-  const code = await pollDeviceAuth(device);
-  return exchangeAuthorizationCode(code.authorizationCode, code.codeVerifier, DEVICE_REDIRECT_URI);
+async function deviceLogin(options = {}) {
+  const device = await startDeviceAuth(options.signal);
+  options.notify?.({
+    message: "Enter this code on the OpenAI verification page.",
+    url: DEVICE_VERIFICATION_URI,
+    code: device.userCode,
+  });
+  if (options.notify === undefined) {
+    console.log(`Open a browser and enter this code: ${device.userCode}\n`);
+    console.log(`Verification URL: ${DEVICE_VERIFICATION_URI}\n`);
+    console.log("Waiting for approval...");
+  }
+  const code = await pollDeviceAuth(device, options.signal);
+  return exchangeAuthorizationCode(code.authorizationCode, code.codeVerifier, DEVICE_REDIRECT_URI, options.signal);
 }
 
 async function saveCredentials(credentials) {
-  return saveOAuthCredentials(oauthFile(), credentials);
+  const { saveOpenAiCredential } = await import("./auth.mjs");
+  return saveOpenAiCredential(credentials);
 }
 
 async function main(args = process.argv.slice(2)) {
@@ -375,7 +400,9 @@ if (entryPath === import.meta.url) {
 export {
   CALLBACK_TIMEOUT_MS,
   authorizationUrl,
+  browserLogin,
   browserOpenCommand,
+  deviceLogin,
   main,
   normalizeDeviceInterval,
   pollDeviceAuth,

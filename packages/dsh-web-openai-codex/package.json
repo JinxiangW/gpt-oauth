@@ -1,22 +1,24 @@
 {
   "name": "dsh-web-openai-codex",
-  "version": "0.1.0",
-  "description": "Toggleable Codex OAuth web search and SSRF-safe HTTP fetch for DeepSeek Harness",
+  "version": "0.3.0",
+  "description": "Codex OAuth search provider for the DeepSeek Harness Web seam (dsh 0.2.0-rc.2 architecture)",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
     "./codex-search": "./lib/codex-search.js",
-    "./safe-http-fetch": "./lib/safe-http-fetch.js"
+    "./safe-http-fetch": "./lib/safe-http-fetch.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "index.js",
     "lib/",
     "smoke-test.mjs",
+    "cordis.patch.yml",
     "README.md"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check lib/codex-search.js && node --check lib/safe-http-fetch.js && node --check lib/document-extractor-worker.js && node --check lib/tool-registration.js && node --check smoke-test.mjs",
+    "check": "node --check index.js && node --check lib/codex-search.js && node --check lib/safe-http-fetch.js && node --check lib/document-extractor-worker.js && node --check lib/tool-registration.js && node --check lib/legacy-agent-toggle.js && node --check smoke-test.mjs",
     "test": "node --test test/*.test.mjs",
     "smoke": "node smoke-test.mjs --live"
   },
@@ -24,10 +26,16 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-tool-web": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-web": "^0.1.0-rc.6",
-    "dsh-llm-openai": ">=0.2.0"
+    "@deepseek-ai/dsh-agent": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-web": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-web": "^0.2.0-rc.2",
+    "dsh-llm-openai": ">=0.4.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "repository": {
     "type": "git",
@@ -39,6 +47,7 @@
     "access": "public"
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1",
     "unpdf": "^1.8.1"
   }
 }

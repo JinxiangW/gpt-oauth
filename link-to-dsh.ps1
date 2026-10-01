@@ -1,74 +1,106 @@
+param(
+  [string]$Profile = $(if ($env:DSH_PROFILE) { $env:DSH_PROFILE } else { 'desktop' }),
+  [switch]$AllowRunningApp
+)
+
 $ErrorActionPreference = 'Stop'
+
+# Link this checkout into a DSH profile as junctions and declare both bundles.
+# Junctions (not `pnpm add file:...`) are deliberate: a `file:` dependency is
+# materialized as a snapshot copy, so source edits would not reach a running
+# host until the profile is reinstalled.
+#
+# Launching DeepSeek Harness boots the `desktop` profile, so that is the default
+# target. `dsh plugin --profile desktop ...` is rejected by the application, so
+# this script writes the manifest and the junctions itself.
 
 $source = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
-$profileModules = Join-Path $dshHome 'profiles\web\node_modules'
-$pluginLink = Join-Path $profileModules 'dsh-llm-openai'
+$profileRoot = Join-Path $dshHome "profiles\$Profile"
+$profileManifest = Join-Path $profileRoot 'package.json'
+$profileModules = Join-Path $profileRoot 'node_modules'
 $webPluginSource = Join-Path $source 'packages\dsh-web-openai-codex'
-$webPluginLink = Join-Path $profileModules 'dsh-web-openai-codex'
-$webDependency = Join-Path $webPluginSource 'node_modules\unpdf\package.json'
-$fallback = Join-Path $dshHome 'profiles\node_modules'
-$dependencyLink = Join-Path $source 'node_modules'
-$npmBin = Join-Path $env:APPDATA 'npm'
-$loginCommand = Join-Path $npmBin 'dsh-openai-login.cmd'
-$node = (Get-Command node -ErrorAction Stop).Source
-$npm = (Get-Command npm.cmd -ErrorAction Stop).Source
+$bundles = @('dsh-llm-openai', 'dsh-web-openai-codex')
 
-if (-not (Test-Path -LiteralPath $fallback)) {
-  throw "dsh fallback modules not found: $fallback (run 'dsh web --help' once first)"
+if (-not (Test-Path -LiteralPath $webPluginSource)) {
+  throw "Codex web plugin source not found: $webPluginSource"
 }
+if (-not (Test-Path -LiteralPath $profileManifest)) {
+  throw "DSH profile manifest not found: $profileManifest (is profile '$Profile' initialized?)"
+}
+
+# The host reads the manifest and every junction at boot; a live process would
+# keep serving the old tree while it is rewritten under it.
+$running = Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue
+if ($running -and -not $AllowRunningApp) {
+  throw "DeepSeek Harness is running (pid $($running.Id -join ', ')); close it first, or pass -AllowRunningApp to relink without restarting it"
+}
+
 if (-not (Test-Path -LiteralPath $profileModules)) {
   New-Item -ItemType Directory -Path $profileModules | Out-Null
-}
-if (-not (Test-Path -LiteralPath $npmBin)) {
-  New-Item -ItemType Directory -Path $npmBin | Out-Null
 }
 
 function Ensure-Junction([string]$Path, [string]$Target, [string]$Label) {
   if (Test-Path -LiteralPath $Path) {
     $item = Get-Item -LiteralPath $Path -Force
-    $sameTarget = ($item.LinkType -eq 'Junction') -and `
-      [string]::Equals(($item.Target -join ''), $Target, [System.StringComparison]::OrdinalIgnoreCase)
+    $resolved = @($item.Target)
+    $sameTarget = ($item.LinkType -eq 'Junction') -and
+      $resolved.Count -gt 0 -and
+      [string]::Equals($resolved[0], $Target, [System.StringComparison]::OrdinalIgnoreCase)
     if ($sameTarget) {
       Write-Host "$Label already ok: $Path -> $Target"
       return
     }
     $kind = if ($item.LinkType) { $item.LinkType } else { $item.GetType().Name }
-    throw "$Path already exists as $kind and is not the expected junction; refusing to replace it"
+    throw "$Path already exists as $kind and is not the expected junction; refusing to replace it (remove it yourself to relink)"
   }
   New-Item -ItemType Junction -Path $Path -Target $Target | Out-Null
   Write-Host "$Label created: $Path -> $Target"
 }
 
-if (-not (Test-Path -LiteralPath $webPluginSource)) {
-  throw "Codex web plugin source not found: $webPluginSource"
+Ensure-Junction (Join-Path $profileModules 'dsh-llm-openai') $source 'LLM plugin link'
+Ensure-Junction (Join-Path $profileModules 'dsh-web-openai-codex') $webPluginSource 'Codex web plugin link'
+
+$manifest = Get-Content -LiteralPath $profileManifest -Raw | ConvertFrom-Json
+if ($null -eq $manifest.dsh -or $null -eq $manifest.dsh.profile) {
+  throw "DSH profile manifest has no dsh.profile section: $profileManifest"
 }
-if (-not (Test-Path -LiteralPath $webDependency)) {
-  Write-Host 'installing Codex web runtime dependencies...'
-  & $npm ci --omit=dev --legacy-peer-deps --prefix $webPluginSource
-  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $webDependency)) {
-    throw "Codex web dependency install failed: $webDependency"
+$declared = [System.Collections.Generic.List[string]]::new()
+foreach ($bundle in @($manifest.dsh.profile.bundles)) { if ($bundle) { $declared.Add([string]$bundle) } }
+foreach ($bundle in $bundles) {
+  if (-not $declared.Contains($bundle)) {
+    $declared.Add($bundle)
+    Write-Host "profile bundle enabled: $bundle"
   }
 }
+$manifest.dsh.profile | Add-Member -NotePropertyName bundles -NotePropertyValue @($declared) -Force
+[System.IO.File]::WriteAllText($profileManifest, ($manifest | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
 
-Ensure-Junction $pluginLink $source 'LLM plugin link'
-Ensure-Junction $webPluginLink $webPluginSource 'Codex web plugin link'
-Ensure-Junction $dependencyLink $fallback 'dependency link'
-
+# The ChatGPT OAuth login entry point is a standalone CLI, not a Loader row.
+$node = (Get-Command node -ErrorAction Stop).Source
+$npmBin = Join-Path $env:APPDATA 'npm'
+$loginCommand = Join-Path $npmBin 'dsh-openai-login.cmd'
 $loginScript = Join-Path $source 'login.mjs'
-$legacyLoginCommandBody = "@echo off`r`n`"$node`" `"$loginScript`" %*`r`n"
+if (-not (Test-Path -LiteralPath $npmBin)) {
+  New-Item -ItemType Directory -Path $npmBin | Out-Null
+}
 $loginCommandBody = "@echo off`r`nrem Created by dsh-llm-openai link-to-dsh.ps1`r`n`"$node`" `"$loginScript`" %*`r`n"
 if (Test-Path -LiteralPath $loginCommand) {
-  $existingCommand = Get-Content -LiteralPath $loginCommand -Raw
-  if ($existingCommand -ceq $loginCommandBody) {
-    Write-Host "login command already ok: $loginCommand"
-  } elseif ($existingCommand -ceq $legacyLoginCommandBody) {
-    Set-Content -LiteralPath $loginCommand -Value $loginCommandBody -Encoding ascii -NoNewline
-    Write-Host "legacy login command upgraded: $loginCommand"
-  } else {
-    throw "$loginCommand already exists and is not this installer's exact shim; refusing to overwrite it"
+  $existing = (Get-Content -LiteralPath $loginCommand -Raw) -replace "`r`n", "`n"
+  if (-not $existing.Contains($loginScript)) {
+    throw "$loginCommand already exists and is not this installer's shim; refusing to overwrite it"
   }
+  Set-Content -LiteralPath $loginCommand -Value $loginCommandBody -Encoding ascii -NoNewline
+  Write-Host "login command refreshed: $loginCommand"
 } else {
   Set-Content -LiteralPath $loginCommand -Value $loginCommandBody -Encoding ascii -NoNewline
   Write-Host "login command installed: $loginCommand"
 }
+
+Write-Host ''
+Write-Host "Linked into profile '$Profile'. Confirm the patch layer selects the provider:"
+Write-Host "  $profileRoot\cordis.patch.yml"
+Write-Host '    - id: web'
+Write-Host '      config:'
+Write-Host '        searchProvider: openai-codex'
+Write-Host 'Then start DeepSeek Harness; use dsh-openai-login first if ChatGPT OAuth is not stored yet.'

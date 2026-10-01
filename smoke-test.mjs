@@ -5,7 +5,9 @@ import { createSubscriptionPiProvider, gptModelCatalog, resolveOAuthAccessToken 
 async function main(args = process.argv.slice(2), dependencies = {}) {
   const noCall = args.includes("--no-call");
   const modelFlag = args.find((arg) => arg.startsWith("--model="));
-  const requestedModel = modelFlag?.slice("--model=".length) || "gpt-5.4-mini";
+  // Keep this default inside the installed Codex catalog; gpt-5.4 left the
+  // catalog in pi-ai 0.86 and gpt-6 replaced that generation.
+  const requestedModel = modelFlag?.slice("--model=".length) || "gpt-5.6-luna";
   const resolveAccess = dependencies.resolveAccess ?? resolveOAuthAccessToken;
   const createCollection = dependencies.createCollection ?? createModels;
 

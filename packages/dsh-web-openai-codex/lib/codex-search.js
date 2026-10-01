@@ -3,6 +3,11 @@ import { WebError } from "@deepseek-ai/dsh-web";
 const OPENAI_CODEX_PROVIDER = "openai-codex";
 const DEFAULT_ASSISTANT_CONTEXT_TOKENS = 1000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+// Wire model used when the DSH session itself is not on the openai-codex route.
+// `alpha/search` needs a model name; it does not need the session to own that
+// model, so any GPT search model in the ChatGPT catalog can serve.
+const DEFAULT_SEARCH_MODEL = "gpt-5.4";
+const MAX_MODEL_CHARS = 200;
 const CHARS_PER_TOKEN_ESTIMATE = 4;
 const MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_SEARCH_OUTPUT_CHARS = 1_000_000;
@@ -80,17 +85,29 @@ export function codexWireModel(model) {
   return model.endsWith("-fast") ? model.slice(0, -"-fast".length) : model;
 }
 
-export function buildCodexSearchRequest({ session, query, maxResults, assistantContextTokens, maxOutputTokens }) {
-  const route = session.requestContext();
-  if (route === undefined) {
-    throw new WebError("Codex web search requires a completed model route in the current DSH session", "WEB_CODEX_MODEL_UNAVAILABLE");
-  }
-  if (route.provider !== OPENAI_CODEX_PROVIDER) {
+/**
+ * Resolve the wire model for one search. The session's own route wins when it
+ * already is `openai-codex`; otherwise the configured `searchModel` serves, so a
+ * DeepSeek (or any other) session still searches through GPT.
+ */
+export function resolveCodexSearchModel(route, searchModel) {
+  if (route?.provider === OPENAI_CODEX_PROVIDER) return codexWireModel(route.model);
+  if (typeof searchModel !== "string" || searchModel.trim().length === 0) {
     throw new WebError(
-      `Codex web search requires the current model provider to be ${OPENAI_CODEX_PROVIDER}; got ${route.provider}`,
-      "WEB_CODEX_PROVIDER_MISMATCH",
+      "Codex web search needs a configured searchModel because the current DSH session is not on the openai-codex provider",
+      "WEB_CODEX_MODEL_UNAVAILABLE",
     );
   }
+  const configured = codexWireModel(searchModel.trim());
+  if (configured.length > MAX_MODEL_CHARS || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(configured)) {
+    throw new WebError(`Codex web search searchModel is not a valid wire model id: ${configured.slice(0, MAX_MODEL_CHARS)}`, "WEB_CODEX_MODEL_UNAVAILABLE");
+  }
+  return configured;
+}
+
+export function buildCodexSearchRequest({ session, query, maxResults, assistantContextTokens, maxOutputTokens, searchModel }) {
+  const route = session.requestContext();
+  const model = resolveCodexSearchModel(route, searchModel);
   if (typeof query !== "string" || query.trim().length === 0) {
     throw new WebError("Codex web search query must not be blank", "WEB_CODEX_INVALID_QUERY");
   }
@@ -99,10 +116,16 @@ export function buildCodexSearchRequest({ session, query, maxResults, assistantC
     throw new Error("web-openai-codex: searchMaxOutputTokens must be a positive integer");
   }
   const resultLimit = Number.isInteger(maxResults) && maxResults > 0 ? maxResults : 8;
+  // Conversation context is only projected when the session itself is a Codex
+  // session. A DeepSeek conversation must not be uploaded to the ChatGPT backend
+  // just to answer a search query.
+  const input = route?.provider === OPENAI_CODEX_PROVIDER
+    ? recentCodexSearchInput(session.deriveMessages(), assistantContextTokens)
+    : undefined;
   return {
     id: String(session.id),
-    model: codexWireModel(route.model),
-    input: recentCodexSearchInput(session.deriveMessages(), assistantContextTokens),
+    model,
+    input,
     commands: {
       search_query: [{ q: query.trim() }],
       response_length: resultLimit <= 4 ? "short" : resultLimit <= 8 ? "medium" : "long",
@@ -265,6 +288,7 @@ export class CodexSearchProvider {
       maxResults: request.maxResults,
       assistantContextTokens: options.assistantContextTokens,
       maxOutputTokens: options.searchMaxOutputTokens,
+      searchModel: options.searchModel,
     });
     let response;
     try {
@@ -293,4 +317,5 @@ export class CodexSearchProvider {
 export const CODEX_SEARCH_DEFAULTS = Object.freeze({
   assistantContextTokens: DEFAULT_ASSISTANT_CONTEXT_TOKENS,
   searchMaxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+  searchModel: DEFAULT_SEARCH_MODEL,
 });

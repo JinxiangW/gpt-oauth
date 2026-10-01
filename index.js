@@ -11,15 +11,19 @@ import {
   attributionHeaders,
   resolveRetryPolicy,
 } from "@deepseek-ai/dsh-llm";
-import {
-  deepEqualJson,
-  installSettingsSection,
-  settingsNamespace,
-} from "@deepseek-ai/dsh-settings";
 import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
+import { bootLog, bootLogError, bootLogStart } from "./boot-log.mjs";
 import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
 import z from "@deepseek-ai/schemastery";
 import { freshAccessFromOwnStore, readOAuthSource } from "./oauth-store.mjs";
+import {
+  OAUTH_CREDENTIAL_KEY,
+  createOpenAiAccessTokenResolver,
+  createOpenAiAuth,
+  migrateLegacyOAuthCredential,
+  registerOpenAiAuthorizationFlow,
+  resolveStoredOAuthAccessToken,
+} from "./auth.mjs";
 import {
   installScopedFetchProxy,
   proxyConfiguredFor,
@@ -31,11 +35,14 @@ import {
 installScopedFetchProxy();
 
 const name = "llm-openai";
-const inject = ["llm"];
+const inject = ["llm", "credentials"];
 
 const PROVIDER = "openai-codex";
 const DISPLAY_NAME = "OpenAI (ChatGPT)";
-const NS = settingsNamespace("llm-openai");
+// DSH 0.2 replaced the settings.yaml sections with per-Loader-entry config, so
+// this is now only the namespace reported to ctx.llm.registerConfigurableProviders
+// (the Models page edits the entry config itself).
+const NS = "llm-openai/openai-codex";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api";
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300000;
@@ -54,45 +61,21 @@ const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const TOKEN_URL = `${AUTH_BASE_URL}/oauth/token`;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 
-// opencode's model catalog ships "-fast" siblings for these ChatGPT models:
-// same wire model id, plus `service_tier: "priority"` on the request.
+// The installed pi-ai Codex catalog ships "-fast" selector siblings for these
+// ChatGPT models: same wire model id, plus `service_tier: "priority"` on the
+// request. The list is maintained here (sync it when the pi-ai catalog changes)
+// because pi-ai itself does not expose a per-model priority-tier capability.
 const FAST_SUFFIX = "-fast";
 const FAST_SERVICE_TIER = "priority";
 const FAST_MODEL_IDS = new Set([
-  "gpt-5.4",
-  "gpt-5.4-mini",
   "gpt-5.5",
   "gpt-5.6-luna",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
+  "gpt-6-astra",
+  "gpt-6-luna",
+  "gpt-6-sol",
 ]);
-
-const CODEX_WEB_CEILINGS = Object.freeze({
-  searchMaxResults: 50,
-  searchTimeoutMs: 120_000,
-  searchMaxOutputTokens: 16_384,
-  assistantContextTokens: 4_000,
-  fetchTimeoutMs: 120_000,
-  fetchMaxResponseBytes: 20 * 1024 * 1024,
-  fetchMaxBodyChars: 1_000_000,
-  fetchMaxRedirects: 10,
-  fetchMaxUrlLength: 8_192,
-  fetchMaxOutputChars: 1_000_000,
-});
-
-const CodexWebConfig = z.object({
-  enabled: z.boolean().default(false).description("Codex Web 总开关：开启后 web_search 使用 ChatGPT OAuth 配额并同时提供安全 web_fetch；关闭后恢复 DSH 默认搜索。"),
-  searchMaxResults: z.number().min(1).max(CODEX_WEB_CEILINGS.searchMaxResults).default(8).description("每次搜索最多返回的结构化来源数。"),
-  searchTimeoutMs: z.number().min(1).max(CODEX_WEB_CEILINGS.searchTimeoutMs).default(60_000).description("web_search 工具超时（毫秒）。"),
-  searchMaxOutputTokens: z.number().min(1).max(CODEX_WEB_CEILINGS.searchMaxOutputTokens).default(4096).description("Codex 搜索接口的最大输出 token 预算。"),
-  assistantContextTokens: z.number().min(1).max(CODEX_WEB_CEILINGS.assistantContextTokens).default(1000).description("发送给 Codex 搜索的近期助手文本预算。"),
-  fetchTimeoutMs: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchTimeoutMs).default(60_000).description("安全 web_fetch 超时（毫秒）。"),
-  fetchMaxResponseBytes: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxResponseBytes).default(5 * 1024 * 1024).description("安全 Fetch 最大响应字节数。"),
-  fetchMaxBodyChars: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxBodyChars).default(100_000).description("返回给工具层的最大正文字符数。"),
-  fetchMaxRedirects: z.number().min(0).max(CODEX_WEB_CEILINGS.fetchMaxRedirects).default(5).description("逐跳安全校验下允许的最大重定向次数。"),
-  fetchMaxUrlLength: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxUrlLength).default(2048).description("允许的最大 URL 长度。"),
-  fetchMaxOutputChars: z.number().min(1).max(CODEX_WEB_CEILINGS.fetchMaxOutputChars).default(200_000).description("渲染给模型的 web_fetch 最大字符数。"),
-}).description("Codex Web Search + SSRF-safe HTTP Fetch");
 
 const Config = z.object({
   baseURL: z.string().default(DEFAULT_BASE_URL),
@@ -102,11 +85,28 @@ const Config = z.object({
     .max(MAX_TIMER_DELAY_MS)
     .default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   retryPolicy: RetryPolicySchema,
-  codexWeb: CodexWebConfig.default({}),
 });
 
-function trustedBaseURL(value = DEFAULT_BASE_URL) {
-  let url;
+// Retry-policy change detection. dsh 0.1.1 exported this predicate from
+// @deepseek-ai/dsh-settings and dsh 0.2.0 from @deepseek-ai/dsh-util-values,
+// which does not exist in 0.1.1; the relation is plain JSON structural equality
+// (keys order-independent, array order significant), so it is implemented here
+// instead of pinning the plugin to one runtime's utility package.
+function deepEqualJson(left, right) {
+  if (left === right) return true;
+  if (typeof left !== typeof right || left === null || right === null) return false;
+  if (typeof left !== "object") return false;
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  if (Array.isArray(left)) {
+    return left.length === right.length && left.every((entry, index) => deepEqualJson(entry, right[index]));
+  }
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => Object.hasOwn(right, key) && deepEqualJson(left[key], right[key]));
+}
+
+function trustedBaseURL(value = DEFAULT_BASE_URL) {  let url;
   try {
     url = new URL(value.trim());
   } catch (error) {
@@ -138,30 +138,6 @@ function resolveAdapterOptions(config) {
     streamIdleTimeoutMs,
     retryPolicy: resolveRetryPolicy(config.retryPolicy, "llm-openai: retryPolicy"),
   };
-}
-
-function safeIntegerSetting(name, value, minimum = 1) {
-  if (!Number.isSafeInteger(value) || value < minimum) {
-    throw new Error(`llm-openai: codexWeb.${name} must be a safe integer >= ${minimum}`);
-  }
-  return value;
-}
-
-function resolveCodexWebOptions(raw = {}) {
-  const value = CodexWebConfig(raw);
-  return Object.freeze({
-    enabled: value.enabled,
-    searchMaxResults: safeIntegerSetting("searchMaxResults", value.searchMaxResults),
-    searchTimeoutMs: safeIntegerSetting("searchTimeoutMs", value.searchTimeoutMs),
-    searchMaxOutputTokens: safeIntegerSetting("searchMaxOutputTokens", value.searchMaxOutputTokens),
-    assistantContextTokens: safeIntegerSetting("assistantContextTokens", value.assistantContextTokens),
-    fetchTimeoutMs: safeIntegerSetting("fetchTimeoutMs", value.fetchTimeoutMs),
-    fetchMaxResponseBytes: safeIntegerSetting("fetchMaxResponseBytes", value.fetchMaxResponseBytes),
-    fetchMaxBodyChars: safeIntegerSetting("fetchMaxBodyChars", value.fetchMaxBodyChars),
-    fetchMaxRedirects: safeIntegerSetting("fetchMaxRedirects", value.fetchMaxRedirects, 0),
-    fetchMaxUrlLength: safeIntegerSetting("fetchMaxUrlLength", value.fetchMaxUrlLength),
-    fetchMaxOutputChars: safeIntegerSetting("fetchMaxOutputChars", value.fetchMaxOutputChars),
-  });
 }
 
 function alignSubscriptionThinking(model) {
@@ -323,7 +299,7 @@ function buildPiProvider(baseProvider, connection) {
     id: PROVIDER,
     name: DISPLAY_NAME,
     baseUrl: connection.baseURL,
-    auth: { apiKey: harnessApiKeyAuth(DISPLAY_NAME) },
+    auth: baseProvider.auth ?? { apiKey: harnessApiKeyAuth(DISPLAY_NAME) },
     getModels: () => models,
     stream: (model, context, options) => codexStream(baseProvider, model, context, options),
     streamSimple: (model, context, options) => codexStreamSimple(baseProvider, model, context, options),
@@ -340,10 +316,17 @@ function buildProfile(baseProvider, connection) {
     headers: {},
     configuredMaxTokens: new Map(models.map((model) => [model.id, model.maxTokens])),
     piProvider: buildPiProvider(baseProvider, connection),
+    // PiAiAdapter.modelOf() reads these two diagnostics on every profile, so a
+    // profile that omits them makes resolveModel() throw and the GUI catalog
+    // drops the whole provider group silently (buildModelCatalog turns the throw
+    // into a provider failure, then filters out empty groups). This adapter owns
+    // one static catalog, so both are genuinely empty rather than unavailable.
+    modelErrors: new Map(),
+    catalogError: undefined,
   };
 }
 
-// ── OAuth token store / opencode fallback ───────────────────────────────────
+// â”€â”€ OAuth token store / opencode fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function ownOAuthPath() {
   return dshHomePath("openai-oauth.json");
@@ -414,6 +397,9 @@ async function freshOwnAccess(path) {
 }
 
 async function resolveOAuthAccessToken(logger = console) {
+  const stored = await resolveStoredOAuthAccessToken();
+  if (stored !== undefined) return stored;
+
   const ownPath = ownOAuthPath();
   let ownSource;
   try {
@@ -483,7 +469,7 @@ function createOpenAiCodexTransport({ resolveAccessToken, logger = console, fetc
       const request = validateCodexTransportRequest(input);
       const accessToken = await resolveAccessToken(logger);
       if (accessToken === undefined) {
-        const error = new Error("llm-openai: no ChatGPT subscription credential is available; run dsh-openai-login to sign in");
+        const error = new Error("llm-openai: no ChatGPT subscription credential is available; run dsh-openai-login");
         error.code = "MISSING_CREDENTIAL";
         throw error;
       }
@@ -518,15 +504,56 @@ function createOpenAiCodexTransport({ resolveAccessToken, logger = console, fetc
   });
 }
 
-function createDshAdapter(ctx, profiles, resolveApiKey) {
+// A model id that is deliberately not a GPT model: it exists only so a failed
+// adapter still yields one visible, self-explanatory entry in the model picker.
+// `buildModelCatalog` drops provider groups whose model list is empty, so a route
+// registered with nothing to show would be invisible â€” exactly the failure mode
+// this sentinel removes.
+const DIAGNOSTIC_MODEL_ID = "route-unavailable";
+
+function diagnosticAdapter(reason) {
+  const model = {
+    id: DIAGNOSTIC_MODEL_ID,
+    name: `Unavailable: ${reason}`,
+    input: ["text"],
+  };
+  return {
+    providerInfo: () => ({ id: PROVIDER, name: DISPLAY_NAME }),
+    listModels: () => Promise.resolve([{
+      provider: PROVIDER,
+      id: DIAGNOSTIC_MODEL_ID,
+      name: model.name,
+      inputModalities: ["text"],
+    }]),
+    resolveModel: () => Promise.resolve({
+      provider: PROVIDER,
+      id: DIAGNOSTIC_MODEL_ID,
+      name: model.name,
+      inputModalities: ["text"],
+      context: { contextWindow: 1 },
+    }),
+    providerRetryPolicy: () => undefined,
+    stream: () => {
+      throw new LlmError(`llm-openai: ${reason}`, "NO_ADAPTER");
+    },
+    streamSimple: () => {
+      throw new LlmError(`llm-openai: ${reason}`, "NO_ADAPTER");
+    },
+  };
+}
+
+function createDshAdapter(ctx, profiles, resolveApiKey, auth = createOpenAiAuth(ctx)) {
   return new PiAiAdapter({
     profiles,
     resolveApiKey,
+    auth,
     resolveAttachments: () => ctx.get("attachments"),
   });
 }
 
 function apply(ctx, config) {
+  bootLogStart("llm-openai");
+  bootLog("llm-openai", `entry: ${import.meta.url}`);
   let current = () => config;
   let lastRaw;
   let lastGood;
@@ -547,9 +574,7 @@ function apply(ctx, config) {
       return lastGood;
     }
   };
-  const webOptions = () => resolveCodexWebOptions(current()?.codexWeb);
   options();
-  webOptions();
 
   const baseProvider = openaiCodexProvider();
   let profileCache;
@@ -561,74 +586,127 @@ function apply(ctx, config) {
     return next;
   };
 
+  const auth = createOpenAiAuth(ctx);
+  const resolveStoredAccess = createOpenAiAccessTokenResolver(auth);
   const resolveApiKey = async () => {
-    const oauthAccess = await resolveOAuthAccessToken(ctx.logger);
+    const oauthAccess = await resolveStoredAccess() ?? await resolveOAuthAccessToken(ctx.logger);
     if (oauthAccess !== undefined) {
       return assertUsableApiKey(oauthAccess, "llm-openai", "OpenAI subscription OAuth");
     }
     throw new LlmError(
-      "llm-openai: no ChatGPT subscription credential is available; run dsh-openai-login to sign in",
+      "llm-openai: no ChatGPT subscription credential is available; run dsh-openai-login",
       "MISSING_CREDENTIAL",
     );
   };
 
   const codexTransport = createOpenAiCodexTransport({
-    resolveAccessToken: resolveOAuthAccessToken,
+    resolveAccessToken: resolveApiKey,
     logger: ctx.logger,
   });
-  const webSettingsListeners = new Set();
-  const notifyWebSettings = () => {
-    for (const listener of [...webSettingsListeners]) {
-      try {
-        listener(webOptions());
-      } catch (error) {
-        ctx.logger.warn(`llm-openai: Codex Web settings listener failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-  };
-  const webSettingsService = Object.freeze({
-    get: webOptions,
-    subscribe(listener) {
-      if (typeof listener !== "function") throw new TypeError("llm-openai: Codex Web settings listener must be a function");
-      webSettingsListeners.add(listener);
-      return () => webSettingsListeners.delete(listener);
-    },
-  });
   ctx.provide(CODEX_TRANSPORT_SERVICE, codexTransport);
-  ctx.provide("openaiCodexWebSettings", webSettingsService);
 
-  const adapter = createDshAdapter(ctx, profiles, resolveApiKey);
-
-  ctx.llm.registerConfigurableProviders([
-    {
-      provider: PROVIDER,
-      displayName: DISPLAY_NAME,
-      settingsNs: NS,
-      settingsPath: [],
-    },
-  ]);
-  const registration = ctx.llm.registerAdapter([PROVIDER], adapter);
-  let registeredPolicy = options().retryPolicy;
-  const ensureRegistrationFacts = () => {
-    const policy = options().retryPolicy;
-    if (deepEqualJson(policy, registeredPolicy)) return;
-    registration.replace([PROVIDER]);
-    registeredPolicy = policy;
-  };
-
-  installSettingsSection(ctx, NS, Config, config, {
-    setSource: (source) => {
-      current = source;
-    },
-    validate: (value) => {
-      resolveAdapterOptions(value);
-      resolveCodexWebOptions(value.codexWeb);
-    },
-    onChange: () => {
-      ensureRegistrationFacts();
-      notifyWebSettings();
-    },
+  ctx.effect(async function* migrateLegacyCredential() {
+    try {
+      await migrateLegacyOAuthCredential(ctx);
+    } catch (error) {
+      ctx.logger.warn("llm-openai: legacy OAuth migration failed; the compatibility fallback remains available");
+      ctx.logger.warn(error);
+    }
+  }, "llm-openai.migrateLegacyOAuthCredential()");
+  ctx.inject(["authorization"], (authorizationCtx) => {
+    registerOpenAiAuthorizationFlow(authorizationCtx);
   });
+
+  // The chat route and the Codex transport are independent capabilities: web
+  // search only needs the transport above, while the GPT model picker needs this
+  // registration. Registration is therefore attempted in two steps, and a
+  // failure is made *visible in the model picker* instead of only being logged:
+  // this plugin runs inside the Electron host, whose stderr nobody reads, so a
+  // log-only failure looks exactly like "the models never appeared". A failed
+  // adapter is replaced by a diagnostic sentinel so the reason shows up where the
+  // user is actually looking.
+  const registerRoute = () => {
+    bootLog("llm-openai", "step declare-route");
+    ctx.llm.registerConfigurableProviders([
+      {
+        provider: PROVIDER,
+        displayName: DISPLAY_NAME,
+        settingsNs: NS,
+        settingsPath: [],
+      },
+    ]);
+    bootLog("llm-openai", "step declare-route ok");
+  };
+  try {
+    registerRoute();
+  } catch (error) {
+    bootLogError("llm-openai", error);
+    // The generic pi-ai adapter declares a route for EVERY provider in its
+    // installed catalog, and that catalog contains openai-codex, so this route is
+    // normally already declared before this plugin activates. That is expected
+    // and harmless: the declaration reserves the route name, while the model list
+    // and the wire protocol come from whichever adapter is registered for it, and
+    // registerAdapter() replaces the adapter for a route. Aborting here is what
+    // previously made the GPT models silently unavailable, so activation
+    // continues and the adapter below takes the route over.
+    const alreadyDeclared = error?.code === "DUPLICATE_DIRECTORY";
+    bootLog(
+      "llm-openai",
+      alreadyDeclared
+        ? "declare-route already declared by another adapter; continuing to claim the route with this plugin's adapter"
+        : "declare-route failed unexpectedly; continuing so the failure stays visible",
+    );
+    if (!alreadyDeclared) {
+      ctx.logger.warn("llm-openai: the openai-codex route could not be declared");
+      ctx.logger.warn(error);
+    }
+  }
+
+  try {
+    bootLog("llm-openai", "step create-adapter");
+    const adapter = createDshAdapter(ctx, profiles, resolveApiKey, auth);
+    bootLog("llm-openai", "step register-adapter");
+    const registration = ctx.llm.registerAdapter([PROVIDER], adapter);
+    bootLog("llm-openai", "step register-adapter ok");
+    let registeredPolicy = options().retryPolicy;
+    const ensureRegistrationFacts = () => {
+      const policy = options().retryPolicy;
+      if (deepEqualJson(policy, registeredPolicy)) return;
+      registration.replace([PROVIDER]);
+      registeredPolicy = policy;
+    };
+
+    // DSH 0.2 has no installSettingsSection: the Loader entry's own config row is
+    // the settings surface, so a changed row remounts this plugin and rebuilds the
+    // adapter facts. The observer below keeps retry-policy changes honest when the
+    // surrounding composition re-resolves config in place instead of remounting.
+    ctx.on("internal/config", function (_raw, next) {
+      if (this === ctx.fiber) ensureRegistrationFacts();
+      return next();
+    });
+  } catch (error) {
+    bootLogError("llm-openai", error);
+    const detail = error instanceof Error ? error.message : String(error);
+    bootLog("llm-openai", `FAIL adapter registration: ${detail}`);
+    ctx.logger.error("llm-openai: the GPT chat adapter could not be registered");
+    ctx.logger.error(error);
+    try {
+      ctx.llm.registerAdapter([PROVIDER], diagnosticAdapter(`adapter registration failed: ${detail}`));
+      bootLog("llm-openai", "diagnostic sentinel registered");
+    } catch (fallbackError) {
+      bootLogError("llm-openai", fallbackError);
+      bootLog("llm-openai", "FAIL diagnostic sentinel registration");
+      ctx.logger.error("llm-openai: the diagnostic route could not be registered either");
+      ctx.logger.error(fallbackError);
+    }
+  }
+  bootLog("llm-openai", `listProviders now: ${(() => {
+    try {
+      return ctx.llm.listProviders().map((provider) => provider.id).join(",");
+    } catch (error) {
+      return `unavailable (${error instanceof Error ? error.message : String(error)})`;
+    }
+  })()}`);
 }
 
 function createSubscriptionPiProvider(baseURL = DEFAULT_BASE_URL) {
@@ -639,24 +717,28 @@ function createSubscriptionPiProvider(baseURL = DEFAULT_BASE_URL) {
 
 export {
   CODEX_TRANSPORT_SERVICE,
-  CodexWebConfig,
+  DIAGNOSTIC_MODEL_ID,
   Config,
   DEFAULT_BASE_URL,
   DISPLAY_NAME,
   NS,
+  OAUTH_CREDENTIAL_KEY,
   PROVIDER,
   apply,
+  buildProfile,
   createDshAdapter,
+  createOpenAiAuth,
   createOpenAiCodexTransport,
   createSubscriptionPiProvider,
+  diagnosticAdapter,
   extractChatGptAccountId,
   gptModelCatalog,
   inOpenAIProxyContext,
   inject,
   name,
   resolveAdapterOptions,
-  resolveCodexWebOptions,
   resolveOAuthAccessToken,
   trustedBaseURL,
   validateCodexTransportRequest,
 };
+

@@ -263,7 +263,10 @@ function resolveLimits(overrides) {
 
 /** Create an anonymous, DNS-pinned DSH WebFetchProvider. Injection options are test seams. */
 export function createSafeHttpFetchProvider(options = {}) {
-  const limits = resolveLimits(options.limits);
+  const staticLimits = options.resolveLimits === undefined ? resolveLimits(options.limits) : undefined;
+  const currentLimits = options.resolveLimits === undefined
+    ? () => staticLimits
+    : () => resolveLimits(options.resolveLimits());
   const dnsLookup = options.dnsLookup ?? defaultDnsLookup;
   const transport = options.transport ?? defaultTransport;
   const documentExtractor = options.documentExtractor ?? defaultDocumentExtractor;
@@ -271,6 +274,7 @@ export function createSafeHttpFetchProvider(options = {}) {
     id: SAFE_HTTP_FETCH_PROVIDER_ID,
     available() { return true; },
     async fetch(request, signal) {
+      const limits = currentLimits();
       if (signal?.aborted) throw webError("web fetch aborted", "WEB_ABORTED", signal.reason);
       const timeoutController = new AbortController();
       const onAbort = () => timeoutController.abort(signal.reason);

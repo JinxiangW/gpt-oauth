@@ -66,6 +66,30 @@ test("combined switch is off by default and installs both standard tools togethe
   assert.equal(toggle.installed.size, 1);
 });
 
+test("web search normalizes and forwards its single query", async () => {
+  const fixture = fakeAgent();
+  let received;
+  const toggle = createAgentWebToggle({
+    agents: { list: () => [fixture.agent] },
+    searchProvider: {
+      async search(input) {
+        received = input;
+        return { sources: [], truncated: false };
+      },
+    },
+    makeFetchProvider: () => ({ fetch() {} }),
+    options: () => baseOptions(true),
+    logger: { error() {}, warn() {} },
+  });
+
+  toggle.reconcileAll();
+  const tool = fixture.registered.find((item) => item.kind === "tool" && item.value.name === "web_search").value;
+  await tool.execute({ query: " current facts " }, {});
+
+  assert.deepEqual(received, { query: "current facts", maxResults: 8 });
+  await assert.rejects(() => tool.execute({ query: "   " }, {}), /query must be a non-empty string/);
+});
+
 test("a running agent defers the whole switch until idle", () => {
   const fixture = fakeAgent();
   let config = baseOptions(true);

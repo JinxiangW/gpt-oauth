@@ -4,7 +4,6 @@ import {
   formatFetchOutput,
   formatSearchOutput,
   parseFetchArgs,
-  parseSearchArgs,
   presentFetchCall,
   presentFetchResult,
   presentSearchCall,
@@ -14,6 +13,12 @@ import {
 
 const SEARCH_GUIDANCE = "Use the web_search tool to discover current information on the web. It returns a Codex-generated answer plus structured source URLs. Follow up with web_fetch when you need the full content of a specific public result, and cite the relevant URLs as markdown links.";
 const FETCH_GUIDANCE = "Use the web_fetch tool to retrieve a specific public HTTP(S) URL (for example a result from web_search). It blocks local and private-network destinations and returns text/HTML, extracted PDF text, or bounded gzip-contained text/PDF content. Cite the URL as a markdown link when you use its content.";
+
+function parseSearchArgs(args) {
+  const query = args.query.trim();
+  if (query.length === 0) throw new Error("query must be a non-empty string");
+  return { query };
+}
 
 function sourceValue(source) {
   return {

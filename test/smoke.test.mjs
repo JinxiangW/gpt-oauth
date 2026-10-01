@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+﻿import assert from "node:assert/strict";
 import test from "node:test";
 
 import { main } from "../smoke-test.mjs";
@@ -26,7 +26,7 @@ test("smoke returns nonzero for non-throwing provider errors", async () => {
       };
     },
   };
-  const code = await main(["--model=gpt-5.4-mini"], {
+  const code = await main(["--model=gpt-5.6-luna"], {
     resolveAccess: async () => "test-token",
     createCollection: () => collection,
   });
@@ -43,7 +43,7 @@ test("smoke returns nonzero when the model does not reply exactly OK", async () 
       };
     },
   };
-  const code = await main(["--model=gpt-5.4-mini"], {
+  const code = await main(["--model=gpt-5.6-luna"], {
     resolveAccess: async () => "test-token",
     createCollection: () => collection,
   });
@@ -57,9 +57,10 @@ test("smoke returns nonzero for thrown API failures", async () => {
       throw new Error("network failed");
     },
   };
-  const code = await main(["--model=gpt-5.4-mini"], {
+  const code = await main(["--model=gpt-5.6-luna"], {
     resolveAccess: async () => "test-token",
     createCollection: () => collection,
   });
   assert.equal(code, 4);
 });
+

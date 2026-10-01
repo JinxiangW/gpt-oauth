@@ -1,28 +1,32 @@
 {
   "name": "dsh-llm-openai",
-  "version": "0.2.0",
-  "description": "ChatGPT subscription OAuth and GPT model adapter for DeepSeek Harness",
+  "version": "0.4.0",
+  "description": "ChatGPT subscription OAuth and GPT model adapter for DeepSeek Harness (dsh 0.2.0-rc.2 architecture)",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
-    "./login": "./login.mjs"
+    "./login": "./login.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "bin": {
     "dsh-openai-login": "login.mjs"
   },
   "files": [
     "index.js",
+    "auth.mjs",
+    "boot-log.mjs",
     "login.mjs",
     "oauth-store.mjs",
     "proxy.mjs",
     "smoke-test.mjs",
+    "cordis.patch.yml",
     "link-to-dsh.ps1",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check login.mjs && node --check oauth-store.mjs && node --check proxy.mjs && node --check smoke-test.mjs && npm --prefix packages/dsh-web-openai-codex run check",
+    "check": "node --check index.js && node --check auth.mjs && node --check login.mjs && node --check oauth-store.mjs && node --check proxy.mjs && node --check smoke-test.mjs && npm --prefix packages/dsh-web-openai-codex run check",
     "test": "node --test test/*.test.mjs && npm --prefix packages/dsh-web-openai-codex test",
     "smoke": "node smoke-test.mjs",
     "smoke:catalog": "node smoke-test.mjs --no-call"
@@ -32,16 +36,24 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "3.18.1",
-    "@earendil-works/pi-ai": "0.82.1",
     "undici": "6.28.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-atomic-write": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-home-paths": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-llm-pi-ai": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-settings": "^0.1.0-rc.6",
-    "@deepseek-ai/dsh-timeout": "^0.1.0-rc.6"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-authorization": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-credentials": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-credentials-local": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-home-paths": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-launch-environment": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm-pi-ai": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-timeout": "^0.2.0-rc.2",
+    "@earendil-works/pi-ai": "^0.87.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   },
   "repository": {
     "type": "git",
@@ -52,3 +64,4 @@
     "access": "public"
   }
 }
+

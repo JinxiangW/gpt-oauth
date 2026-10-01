@@ -1,0 +1,11 @@
+# Compose the Codex search provider into this profile's host `web` row. A profile
+# patch replaces a row's complete config, so the selected provider is stated here
+# (this drops the base row's `searchProvider: deepseek-official`) and the plugin's
+# own row carries the settings that used to live in settings.yaml.
+- id: web
+  config:
+    searchProvider: openai-codex
+
+- insert:
+    - id: web-openai-codex
+      name: dsh-web-openai-codex
