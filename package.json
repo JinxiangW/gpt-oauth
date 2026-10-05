@@ -7,6 +7,7 @@
   "exports": {
     ".": "./index.js",
     "./login": "./login.mjs",
+    "./boot-log": "./boot-log.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "bin": {
@@ -16,7 +17,9 @@
     "index.js",
     "auth.mjs",
     "boot-log.mjs",
+    "codex-catalog.mjs",
     "login.mjs",
+    "desktop-login.mjs",
     "oauth-store.mjs",
     "proxy.mjs",
     "smoke-test.mjs",
@@ -26,7 +29,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check auth.mjs && node --check login.mjs && node --check oauth-store.mjs && node --check proxy.mjs && node --check smoke-test.mjs && npm --prefix packages/dsh-web-openai-codex run check",
+    "check": "node --check index.js && node --check codex-catalog.mjs && node --check auth.mjs && node --check login.mjs && node --check oauth-store.mjs && node --check proxy.mjs && node --check smoke-test.mjs && npm --prefix packages/dsh-web-openai-codex run check",
     "test": "node --test test/*.test.mjs && npm --prefix packages/dsh-web-openai-codex test",
     "smoke": "node smoke-test.mjs",
     "smoke:catalog": "node smoke-test.mjs --no-call"
@@ -35,8 +38,9 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
+    "@deepseek-ai/dsh-atomic-write": "0.2.0-rc.2",
     "@deepseek-ai/schemastery": "3.18.1",
-    "undici": "6.28.0"
+    "undici": "6.29.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
@@ -64,4 +68,3 @@
     "access": "public"
   }
 }
-

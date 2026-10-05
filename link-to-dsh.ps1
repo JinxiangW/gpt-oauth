@@ -61,6 +61,14 @@ function Ensure-Junction([string]$Path, [string]$Target, [string]$Label) {
 Ensure-Junction (Join-Path $profileModules 'dsh-llm-openai') $source 'LLM plugin link'
 Ensure-Junction (Join-Path $profileModules 'dsh-web-openai-codex') $webPluginSource 'Codex web plugin link'
 
+# Node resolves imports from a junction's real checkout path. The sibling link
+# in the profile is therefore insufficient for the Web package's LLM peer.
+$webPluginModules = Join-Path $webPluginSource 'node_modules'
+if (-not (Test-Path -LiteralPath $webPluginModules)) {
+  New-Item -ItemType Directory -Path $webPluginModules | Out-Null
+}
+Ensure-Junction (Join-Path $webPluginModules 'dsh-llm-openai') $source 'Web plugin LLM peer link'
+
 $manifest = Get-Content -LiteralPath $profileManifest -Raw | ConvertFrom-Json
 if ($null -eq $manifest.dsh -or $null -eq $manifest.dsh.profile) {
   throw "DSH profile manifest has no dsh.profile section: $profileManifest"
@@ -85,9 +93,16 @@ if (-not (Test-Path -LiteralPath $npmBin)) {
   New-Item -ItemType Directory -Path $npmBin | Out-Null
 }
 $loginCommandBody = "@echo off`r`nrem Created by dsh-llm-openai link-to-dsh.ps1`r`n`"$node`" `"$loginScript`" %*`r`n"
+# Desktop peers live inside app.asar, and system Node cannot resolve them.
+# The Electron bootstrap shares those peers and uses the Host's Node version.
+$desktopExecutable = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'
+if ($Profile -eq 'desktop' -and (Test-Path -LiteralPath $desktopExecutable)) {
+  $desktopLoginScript = Join-Path $source 'desktop-login.mjs'
+  $loginCommandBody = "@echo off`r`nrem Created by dsh-llm-openai link-to-dsh.ps1`r`nsetlocal`r`nset `"ELECTRON_RUN_AS_NODE=1`"`r`n`"$desktopExecutable`" `"$desktopLoginScript`" %*`r`n"
+}
 if (Test-Path -LiteralPath $loginCommand) {
   $existing = (Get-Content -LiteralPath $loginCommand -Raw) -replace "`r`n", "`n"
-  if (-not $existing.Contains($loginScript)) {
+  if (-not $existing.Contains($loginScript) -and -not $existing.Contains((Join-Path $source 'desktop-login.mjs'))) {
     throw "$loginCommand already exists and is not this installer's shim; refusing to overwrite it"
   }
   Set-Content -LiteralPath $loginCommand -Value $loginCommandBody -Encoding ascii -NoNewline

@@ -173,10 +173,28 @@ function startCallbackServer(state, options = {}) {
   });
 }
 
+const OAUTH_REQUEST_TIMEOUT_MS = 60_000;
+
+function oauthFetch(url, init) {
+  const timeout = AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS);
+  const signal = init.signal === undefined ? timeout : AbortSignal.any([init.signal, timeout]);
+  return withOpenAIProxy(() => fetch(url, { ...init, signal }));
+}
+
+async function oauthErrorCode(response) {
+  try {
+    const payload = await response.json();
+    const value = typeof payload?.error === "string" ? payload.error : payload?.error?.code;
+    return typeof value === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function readTokenResponse(response, operation) {
   if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`OpenAI token ${operation} failed (HTTP ${response.status}): ${body.slice(0, 400)}`);
+    const code = await oauthErrorCode(response);
+    throw new Error(`OpenAI token ${operation} failed (HTTP ${response.status})${code ? `: ${code}` : ""}`);
   }
   let payload;
   try {
@@ -204,7 +222,7 @@ async function readTokenResponse(response, operation) {
 }
 
 async function exchangeAuthorizationCode(code, verifier, redirectUri, signal) {
-  const response = await withOpenAIProxy(() => fetch(TOKEN_URL, {
+  const response = await oauthFetch(TOKEN_URL, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -215,7 +233,7 @@ async function exchangeAuthorizationCode(code, verifier, redirectUri, signal) {
       redirect_uri: redirectUri,
     }),
     signal,
-  }));
+  });
   return readTokenResponse(response, "exchange");
 }
 
@@ -259,15 +277,15 @@ function normalizeDeviceInterval(value) {
 }
 
 async function startDeviceAuth(signal) {
-  const response = await withOpenAIProxy(() => fetch(DEVICE_USER_CODE_URL, {
+  const response = await oauthFetch(DEVICE_USER_CODE_URL, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ client_id: CLIENT_ID }),
     signal,
-  }));
+  });
   if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(`OpenAI device-code request failed (HTTP ${response.status}): ${body.slice(0, 400)}`);
+    const code = await oauthErrorCode(response);
+    throw new Error(`OpenAI device-code request failed (HTTP ${response.status})${code ? `: ${code}` : ""}`);
   }
   const payload = await response.json();
   const interval = normalizeDeviceInterval(payload?.interval);
@@ -278,7 +296,7 @@ async function startDeviceAuth(signal) {
     payload.user_code.length === 0 ||
     interval === undefined
   ) {
-    throw new Error(`Invalid OpenAI device-code response: ${JSON.stringify(payload)}`);
+    throw new Error("Invalid OpenAI device-code response: missing or invalid device_auth_id, user_code, or interval");
   }
   return {
     deviceAuthId: payload.device_auth_id,
@@ -305,9 +323,11 @@ function delay(ms, signal) {
 
 async function pollDeviceAuth(device, signal) {
   const deadline = Date.now() + DEVICE_CODE_TIMEOUT_SECONDS * 1000;
+  const timeout = AbortSignal.timeout(DEVICE_CODE_TIMEOUT_SECONDS * 1000);
+  signal = signal === undefined ? timeout : AbortSignal.any([signal, timeout]);
   let intervalSeconds = Math.max(MIN_DEVICE_POLL_SECONDS, device.intervalSeconds);
   while (Date.now() < deadline) {
-    const response = await withOpenAIProxy(() => fetch(DEVICE_TOKEN_URL, {
+    const response = await oauthFetch(DEVICE_TOKEN_URL, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -315,7 +335,7 @@ async function pollDeviceAuth(device, signal) {
         user_code: device.userCode,
       }),
       signal,
-    }));
+    });
     if (response.ok) {
       const payload = await response.json();
       if (
@@ -324,7 +344,7 @@ async function pollDeviceAuth(device, signal) {
         typeof payload?.code_verifier !== "string" ||
         payload.code_verifier.length === 0
       ) {
-        throw new Error(`Invalid OpenAI device-auth token response: ${JSON.stringify(payload)}`);
+        throw new Error("Invalid OpenAI device-auth token response: missing or invalid authorization_code or code_verifier");
       }
       return {
         authorizationCode: payload.authorization_code,
@@ -336,14 +356,7 @@ async function pollDeviceAuth(device, signal) {
       await delay(intervalSeconds * 1000, signal);
       continue;
     }
-    const body = await response.text().catch(() => "");
-    let errorCode;
-    try {
-      const error = JSON.parse(body)?.error;
-      errorCode = typeof error === "object" ? error?.code : error;
-    } catch {
-      errorCode = undefined;
-    }
+    const errorCode = await oauthErrorCode(response);
     if (errorCode === "slow_down") {
       intervalSeconds += SLOW_DOWN_INCREMENT_SECONDS;
       await delay(intervalSeconds * 1000, signal);
@@ -353,7 +366,7 @@ async function pollDeviceAuth(device, signal) {
       await delay(intervalSeconds * 1000, signal);
       continue;
     }
-    throw new Error(`OpenAI device auth failed (HTTP ${response.status}): ${body.slice(0, 400)}`);
+    throw new Error(`OpenAI device auth failed (HTTP ${response.status})${errorCode ? `: ${errorCode}` : ""}`);
   }
   throw new Error("OpenAI device-code login timed out");
 }

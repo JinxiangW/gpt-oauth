@@ -5,6 +5,7 @@
 - id: web
   config:
     searchProvider: openai-codex
+    fetchProvider: http
 
 - insert:
     - id: web-openai-codex

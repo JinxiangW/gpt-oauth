@@ -11,7 +11,8 @@ third-party gateway.
 
 ## Models
 
-The model list follows pi-ai's installed OpenAI Codex catalog. `@earendil-works/pi-ai`
+The model list follows pi-ai's installed OpenAI Codex catalog, with a GPT-6.1 Sol
+catalog backport for the current Desktop runtime. `@earendil-works/pi-ai`
 is a **peer** dependency pinned to the `^0.87.1` line, which is the version the
 DSH `0.2.0-rc.2` runtime itself bundles; the plugin therefore shares the host's
 pi-ai instance instead of loading a second copy with its own provider contract.
@@ -20,15 +21,28 @@ That range is what the current catalog requires:
 - GPT-6 (`gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`) first appears in pi-ai
   `0.85.1`/`0.87.1`; `0.82.1`-`0.84.x` stop at `gpt-5.6`.
 - pi-ai `0.86` dropped `gpt-5.4` and `gpt-5.4-mini`, so those ids are gone.
-- pi-ai `0.99.x` adds `gpt-6.1-sol`, but no published DSH runtime bundles that
-  line yet, so it is deliberately not claimed here.
+- pi-ai `0.99.x` adds `gpt-6.1-sol`. `codex-catalog.mjs` backports its `0.99.2`
+  subscription descriptor without replacing the Harness's shared pi-ai runtime.
+  If the host later supplies the same id, its descriptor takes precedence.
 
 With `0.87.1` the resolved catalog is:
 
-- `gpt-5.3-codex-spark`
 - `gpt-5.5`
 - `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`
 - `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`
+- `gpt-6.1-sol` (catalog backport; Standard and Fast)
+
+GPT-5.3 Codex Spark is filtered out because it retired from ChatGPT subscription
+Codex on September 14, 2026. The shared catalog still contains its historical
+descriptor. Reasoning selectors retain each model's upstream capabilities,
+including GPT-6 Max and Astra's prohibition on `off`.
+
+GPT-6.1 Sol offers `low`, `medium`, `high`, `xhigh`, and `max` reasoning. It does
+not offer `off`/`none` or `minimal`, matching the
+[OpenAI model documentation](https://developers.openai.com/api/docs/models/gpt-6.1-sol).
+The backport retains pi-ai's subscription context limit of 272,000 tokens and
+128,000 output tokens. Model visibility does not guarantee account access;
+the ChatGPT backend enforces the account's model and speed entitlements.
 
 Models in `FAST_MODEL_IDS` also receive `-fast` selector variants: same wire model
 with `service_tier: priority` (pi-ai applies the priority cost multiplier and
@@ -58,8 +72,8 @@ Version 0.4 migrates the plugin to the `0.2.0-rc.2` Harness contracts:
 - `@earendil-works/pi-ai` moved from a pinned `0.82.1` dependency to the
   `^0.87.1` peer range so the host runtime supplies the instance (see Models).
 
-The shipped `cordis.patch.yml` is a DSH profile bundle that mounts the
-`authorization` seam and the adapter. Do not configure the generic
+The shipped `cordis.patch.yml` is a DSH profile bundle that mounts the adapter
+and reuses the `authorization` seam from `dsh-base`. Do not configure the generic
 `llm-pi-ai` plugin's own `openai-codex` route at the same time; both would claim
 the same LLM route.
 

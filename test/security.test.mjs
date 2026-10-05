@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   createDshAdapter,
@@ -25,7 +25,9 @@ import {
 } from "../proxy.mjs";
 import {
   browserOpenCommand,
+  deviceLogin,
   normalizeDeviceInterval,
+  pollDeviceAuth,
   startCallbackServer,
 } from "../login.mjs";
 
@@ -81,6 +83,55 @@ test("proxy parsing honors protocol routes and bypass lists", () => {
     }),
     /no https route/,
   );
+});
+
+test("a malformed Windows proxy keeps failing on repeated reads", { skip: process.platform !== "win32" }, async () => {
+  const proxyUrl = new URL("../proxy.mjs", import.meta.url).href;
+  const script = `
+    const { createRequire, syncBuiltinESMExports } = await import("node:module");
+    const require = createRequire(import.meta.url);
+    const childProcess = require("node:child_process");
+    childProcess.execFileSync = () => "ProxyEnable REG_DWORD 0x1\\nProxyServer REG_SZ http=proxy:8080;broken";
+    syncBuiltinESMExports();
+    const { windowsSystemProxy } = await import(${JSON.stringify(proxyUrl)});
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let rejected = false;
+      try { windowsSystemProxy(); } catch { rejected = true; }
+      if (!rejected) throw new Error("invalid proxy silently bypassed on attempt " + attempt);
+    }
+  `;
+  await execFileAsync(process.execPath, ["--input-type=module", "--eval", script]);
+});
+
+test("device login requests have a deadline and malformed responses do not expose authorization values", async () => {
+  const previousFetch = globalThis.fetch;
+  try {
+    let signal;
+    globalThis.fetch = async (_url, init) => {
+      signal = init.signal;
+      return new Response(JSON.stringify({ device_auth_id: "private-device-id", user_code: "private-user-code" }));
+    };
+    await assert.rejects(deviceLogin({ notify() {} }), error => {
+      assert.match(error.message, /Invalid OpenAI device-code response/);
+      assert.ok(!error.message.includes("private-"));
+      return true;
+    });
+    assert.ok(signal instanceof AbortSignal);
+    globalThis.fetch = async () => new Response(JSON.stringify({ authorization_code: "private-auth-code", code_verifier: "" }));
+    await assert.rejects(pollDeviceAuth({ deviceAuthId: "test", userCode: "test", intervalSeconds: 1 }), error => {
+      assert.match(error.message, /Invalid OpenAI device-auth token response/);
+      assert.ok(!error.message.includes("private-auth-code"));
+      return true;
+    });
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: "invalid_grant", access_token: "private-access-token" }), { status: 400 });
+    await assert.rejects(deviceLogin({ notify() {} }), error => {
+      assert.match(error.message, /invalid_grant/);
+      assert.ok(!error.message.includes("private-access-token"));
+      return true;
+    });
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 });
 
 test("fetch proxy changes behavior only inside its async context", async () => {
@@ -197,22 +248,55 @@ test("OAuth callback timeout settles and closes cleanly", async () => {
 test("installer refuses an existing real plugin directory without deleting it", { skip: process.platform !== "win32" }, async () => {
   const root = await mkdtemp(join(tmpdir(), "dsh-openai-installer-"));
   const dshHome = join(root, "dsh-home");
-  const pluginPath = join(dshHome, "profiles", "web", "node_modules", "dsh-llm-openai");
+  const profilePath = join(dshHome, "profiles", "desktop");
+  const pluginPath = join(profilePath, "node_modules", "dsh-llm-openai");
   const sentinel = join(pluginPath, "keep.txt");
   try {
     await mkdir(join(dshHome, "profiles", "node_modules"), { recursive: true });
     await mkdir(pluginPath, { recursive: true });
+    await writeFile(join(profilePath, "package.json"), JSON.stringify({ name: "installer-test", private: true, dsh: { profile: { bundles: [] } } }));
     await writeFile(sentinel, "keep", "utf8");
     await assert.rejects(
       execFileAsync("pwsh", [
         "-NoProfile",
         "-ExecutionPolicy", "Bypass",
         "-File", fileURLToPath(new URL("../link-to-dsh.ps1", import.meta.url)),
+        "-Profile", "desktop", "-AllowRunningApp",
       ], {
         env: { ...process.env, DSH_HOME: dshHome, APPDATA: join(root, "appdata") },
       }),
+      error => /refusing to replace/.test(error.stderr),
     );
     assert.equal(await readFile(sentinel, "utf8"), "keep");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the checkout installer resolves the Web package's LLM peer and is repeatable", { skip: process.platform !== "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dsh-openai-peer-installer-"));
+  const checkout = join(root, "checkout");
+  const webPackage = join(checkout, "packages", "dsh-web-openai-codex");
+  const dshHome = join(root, "dsh-home");
+  const profilePath = join(dshHome, "profiles", "desktop");
+  try {
+    await mkdir(webPackage, { recursive: true });
+    await mkdir(profilePath, { recursive: true });
+    await copyFile(new URL("../link-to-dsh.ps1", import.meta.url), join(checkout, "link-to-dsh.ps1"));
+    await writeFile(join(checkout, "package.json"), JSON.stringify({ name: "dsh-llm-openai", version: "0.4.0", type: "module", exports: { "./boot-log": "./boot-log.mjs" } }));
+    await writeFile(join(checkout, "boot-log.mjs"), "export const value = 'resolved-local-peer';\n");
+    await writeFile(join(webPackage, "package.json"), JSON.stringify({ name: "dsh-web-openai-codex", type: "module" }));
+    await writeFile(join(webPackage, "probe.mjs"), "export { value } from 'dsh-llm-openai/boot-log';\n");
+    await writeFile(join(profilePath, "package.json"), JSON.stringify({ name: "installer-test", private: true, dsh: { profile: { bundles: [] } } }));
+    const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(checkout, "link-to-dsh.ps1"), "-Profile", "desktop", "-AllowRunningApp"];
+    const options = { env: { ...process.env, DSH_HOME: dshHome, APPDATA: join(root, "appdata"), LOCALAPPDATA: join(root, "localappdata") } };
+    await execFileAsync("pwsh", args, options);
+    const resolved = await import(pathToFileURL(join(webPackage, "probe.mjs")).href);
+    assert.equal(resolved.value, "resolved-local-peer");
+    const repeated = await execFileAsync("pwsh", args, options);
+    assert.match(repeated.stdout, /Web plugin LLM peer link already ok/);
+    const manifest = JSON.parse(await readFile(join(profilePath, "package.json"), "utf8"));
+    assert.deepEqual(manifest.dsh.profile.bundles, ["dsh-llm-openai", "dsh-web-openai-codex"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

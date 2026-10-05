@@ -55,7 +55,7 @@ export async function main(args = process.argv.slice(2), dependencies = {}) {
   };
 
   try {
-    const result = await search.search({ query, maxResults: 4 }, undefined, { session });
+    const result = await search.search({ query, maxResults: 4 }, AbortSignal.timeout(45_000), { session });
     console.log(`SEARCH_OK sources=${result.sources.length} truncated=${result.truncated} contentChars=${result.content?.length ?? 0}`);
   } catch (error) {
     console.error(`SEARCH_FAILED code=${error?.code ?? "UNKNOWN"} message=${error instanceof Error ? error.message : String(error)}`);
@@ -64,7 +64,7 @@ export async function main(args = process.argv.slice(2), dependencies = {}) {
 
   const fetch = (dependencies.createFetchProvider ?? createSafeHttpFetchProvider)();
   try {
-    const result = await fetch.fetch({ url: "https://example.com/" });
+    const result = await fetch.fetch({ url: "https://example.com/" }, AbortSignal.timeout(30_000));
     console.log(`FETCH_OK status=${result.statusCode} kind=${result.body.kind} chars=${result.body.content.length}`);
   } catch (error) {
     console.error(`FETCH_FAILED code=${error?.code ?? "UNKNOWN"} message=${error instanceof Error ? error.message : String(error)}`);

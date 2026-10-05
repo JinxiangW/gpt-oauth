@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { CODEX_SEARCH_DEFAULTS } from "../lib/codex-search.js";
+
+test("new installations use a current subscription model for search", () => {
+  assert.equal(CODEX_SEARCH_DEFAULTS.searchModel, "gpt-6-luna");
+});
 
 import {
   CodexSearchProvider,

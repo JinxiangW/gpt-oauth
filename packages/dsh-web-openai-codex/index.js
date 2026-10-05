@@ -1,5 +1,5 @@
 import z from "@deepseek-ai/schemastery";
-import { bootLog, bootLogStart } from "../../boot-log.mjs";
+import { bootLog, bootLogStart } from "dsh-llm-openai/boot-log";
 import { CODEX_SEARCH_DEFAULTS, CodexSearchProvider } from "./lib/codex-search.js";
 import { createAgentWebToggle } from "./lib/legacy-agent-toggle.js";
 import {

@@ -13,6 +13,7 @@ import {
 } from "@deepseek-ai/dsh-llm";
 import { dshHomePath } from "@deepseek-ai/dsh-home-paths";
 import { bootLog, bootLogError, bootLogStart } from "./boot-log.mjs";
+import { supplementCodexCatalog } from "./codex-catalog.mjs";
 import { MAX_TIMER_DELAY_MS } from "@deepseek-ai/dsh-timeout";
 import z from "@deepseek-ai/schemastery";
 import { freshAccessFromOwnStore, readOAuthSource } from "./oauth-store.mjs";
@@ -67,6 +68,9 @@ const TOKEN_REFRESH_SKEW_MS = 60_000;
 // because pi-ai itself does not expose a per-model priority-tier capability.
 const FAST_SUFFIX = "-fast";
 const FAST_SERVICE_TIER = "priority";
+// Retired from ChatGPT subscription Codex on 2026-09-14; still present in
+// the Harness's bundled 0.87.1 catalog.
+const RETIRED_CODEX_MODEL_IDS = new Set(["gpt-5.3-codex-spark"]);
 const FAST_MODEL_IDS = new Set([
   "gpt-5.5",
   "gpt-5.6-luna",
@@ -75,6 +79,7 @@ const FAST_MODEL_IDS = new Set([
   "gpt-6-astra",
   "gpt-6-luna",
   "gpt-6-sol",
+  "gpt-6.1-sol",
 ]);
 
 const Config = z.object({
@@ -141,21 +146,19 @@ function resolveAdapterOptions(config) {
 }
 
 function alignSubscriptionThinking(model) {
-  const efforts = {
-    off: "none",
-    low: "low",
-    medium: "medium",
-    high: "high",
-    xhigh: "xhigh",
-  };
-  if (model.id.startsWith("gpt-5.6-")) efforts.max = "max";
+  if (!model.reasoning) return model;
+  const declared = model.thinkingLevelMap ?? {};
   return {
     ...model,
-    reasoning: true,
+    // Keep the upstream capability map: Astra/6.1 Sol forbid off, while
+    // GPT-6 offers Max. Hide the redundant minimal-to-low selector alias.
     thinkingLevelMap: Object.fromEntries(
       ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => [
         level,
-        efforts[level] ?? null,
+        level === "minimal" ? null
+          : level === "off" ? (Object.hasOwn(declared, level) ? declared[level] : "none")
+          : level === "xhigh" || level === "max" ? (declared[level] ?? null)
+          : (Object.hasOwn(declared, level) ? declared[level] : level),
       ]),
     ),
   };
@@ -171,9 +174,8 @@ function fastVariant(model) {
 
 function gptModelCatalog(baseURL = DEFAULT_BASE_URL) {
   const trusted = trustedBaseURL(baseURL);
-  const models = openaiCodexProvider()
-    .getModels()
-    .filter((model) => typeof model.id === "string" && model.id.startsWith("gpt-"))
+  const models = supplementCodexCatalog(openaiCodexProvider().getModels())
+    .filter((model) => typeof model.id === "string" && model.id.startsWith("gpt-") && !RETIRED_CODEX_MODEL_IDS.has(model.id))
     .map((model) =>
       alignSubscriptionThinking({
         ...model,
@@ -357,6 +359,7 @@ async function refreshOAuthToken(refreshToken) {
         refresh_token: refreshToken,
         client_id: CLIENT_ID,
       }),
+      signal: AbortSignal.timeout(60_000),
     }));
   } catch (error) {
     throw new Error(`OpenAI subscription token refresh request failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -640,7 +643,6 @@ function apply(ctx, config) {
   try {
     registerRoute();
   } catch (error) {
-    bootLogError("llm-openai", error);
     // The generic pi-ai adapter declares a route for EVERY provider in its
     // installed catalog, and that catalog contains openai-codex, so this route is
     // normally already declared before this plugin activates. That is expected
@@ -650,6 +652,7 @@ function apply(ctx, config) {
     // previously made the GPT models silently unavailable, so activation
     // continues and the adapter below takes the route over.
     const alreadyDeclared = error?.code === "DUPLICATE_DIRECTORY";
+    if (!alreadyDeclared) bootLogError("llm-openai", error);
     bootLog(
       "llm-openai",
       alreadyDeclared

@@ -1,8 +1,7 @@
-# dsh-llm-openai bundle: the subscription adapter and the DSH authorization seam.
+# dsh-llm-openai bundle: the subscription adapter. dsh-base already owns the
+# authorization seam; inserting it again duplicates the Loader entry.
 # The default llm-pi-ai row remains available for other provider profiles; do not
 # configure its openai-codex route at the same time as this dedicated adapter.
 - insert:
-    - id: authorization
-      name: '@deepseek-ai/dsh-authorization'
     - id: llm-openai
       name: dsh-llm-openai

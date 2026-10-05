@@ -6,7 +6,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
 // Wire model used when the DSH session itself is not on the openai-codex route.
 // `alpha/search` needs a model name; it does not need the session to own that
 // model, so any GPT search model in the ChatGPT catalog can serve.
-const DEFAULT_SEARCH_MODEL = "gpt-5.4";
+const DEFAULT_SEARCH_MODEL = "gpt-6-luna";
 const MAX_MODEL_CHARS = 200;
 const CHARS_PER_TOKEN_ESTIMATE = 4;
 const MAX_SEARCH_RESPONSE_BYTES = 2 * 1024 * 1024;

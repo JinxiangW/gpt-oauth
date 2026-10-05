@@ -21,8 +21,8 @@ standard DSH schema, concurrent multi-query execution, formatting, structured
 errors, presentation, and lifecycle instead of maintaining a private copy of the
 tool.
 
-Stock DSH mounts no fetch provider, so `apply()` does not register Safe Fetch
-either; the provider factory stays exported for a composition that wants it. The
+The bundle preserves DSH's built-in `http` fetch provider. `apply()` does not
+register Safe Fetch; the provider factory stays exported for a composition that wants it. The
 older `createAgentWebToggle` export remains as a compatibility shim for 0.1.x
 API consumers but is no longer used by the plugin.
 
@@ -36,8 +36,7 @@ Search runs on GPT regardless of which model the session uses:
 - with any other session model (for example DeepSeek), search uses the
   configured `searchModel` and **omits the conversation entirely**, so a
   non-Codex conversation is never uploaded to the ChatGPT backend. The built-in
-  default is still the `gpt-5.4` wire id; the desktop profile in this repository
-  sets `gpt-6-luna`.
+  default is `gpt-6-luna`.
 
 A missing initiating agent, missing OAuth transport, unusable `searchModel`, or
 source-less response fails explicitly; it never silently falls back to another

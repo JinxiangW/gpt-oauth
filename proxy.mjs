@@ -121,7 +121,6 @@ let cachedWindowsProxyResolved = false;
 
 export function windowsSystemProxy() {
   if (cachedWindowsProxyResolved) return cachedWindowsProxy;
-  cachedWindowsProxyResolved = true;
   let output;
   try {
     output = execFileSync(
@@ -131,12 +130,14 @@ export function windowsSystemProxy() {
     );
   } catch {
     cachedWindowsProxy = undefined;
+    cachedWindowsProxyResolved = true;
     return cachedWindowsProxy;
   }
 
   const enabled = output.match(/ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)/i);
   if (enabled === null || Number.parseInt(enabled[1], 16) === 0) {
     cachedWindowsProxy = undefined;
+    cachedWindowsProxyResolved = true;
     return cachedWindowsProxy;
   }
 
@@ -153,6 +154,7 @@ export function windowsSystemProxy() {
     routes,
     override: override?.[1]?.trim(),
   };
+  cachedWindowsProxyResolved = true;
   return cachedWindowsProxy;
 }
 
