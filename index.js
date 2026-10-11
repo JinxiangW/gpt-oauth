@@ -315,6 +315,12 @@ function buildProfile(baseProvider, connection) {
     displayName: DISPLAY_NAME,
     streamIdleTimeoutMs: connection.streamIdleTimeoutMs,
     retryPolicy: connection.retryPolicy,
+    // This hand-built profile bypasses PiAiAdapter's profile resolver. Supply
+    // its image defaults explicitly: an undefined pixel budget yields NaN
+    // request dimensions even when the pasted attachment has valid geometry.
+    requestImagePixelBudget: 4_194_304,
+    requestImageMaxBytes: 1_048_576,
+    maxRequestImageBytes: 20_971_520,
     headers: {},
     configuredMaxTokens: new Map(models.map((model) => [model.id, model.maxTokens])),
     piProvider: buildPiProvider(baseProvider, connection),
