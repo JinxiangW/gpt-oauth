@@ -1,2 +1,6 @@
 node_modules/
 *.log
+
+# Machine-local migration notes and verification reports (paths/config metadata).
+/WEB-PROFILE-UI-MIGRATION.md
+/web-profile-ui-verification*.json

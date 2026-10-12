@@ -172,6 +172,14 @@ checkout plus this patch layer:
 application after changing the composition, then confirm the loaded rows in the
 Settings plugin inventory and run one `web_search`.
 
+## Optional Web UI profile migration
+
+For a profile still using the retired third-party UI aggregate, see the
+[DSH 0.2.0-rc.2 migration guide](<docs/web-profile-ui-migration.md>) for the reviewed
+`0.4.6` replacement, profile-local skin and settings-secret patches, and
+service-free verification. OpenAI/Codex remain separately selected bundles;
+these optional UI patches are not applied automatically by this plugin.
+
 ## Proxy behavior
 
 The plugin reads `DSH_OPENAI_PROXY`, `OPENAI_PROXY`, standard HTTP(S) proxy

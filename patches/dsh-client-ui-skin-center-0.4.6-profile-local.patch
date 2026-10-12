@@ -1,0 +1,42 @@
+diff --git a/lib/index.js b/lib/index.js
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -1293,13 +1293,11 @@
+ 		return /* @__PURE__ */ new Set();
+ 	}
+ }
+-/** User skins live in $DSH_HOME/skins with explicit directory overrides. */
+-function userSkinsDir(env = process.env) {
+-	const home = env.DSH_SKINS_HOME;
+-	if (home && home.trim() !== "") return resolve(home);
+-	const dir = env.DSH_SKINS_DIR;
+-	if (dir && dir.trim() !== "") return resolve(dir);
+-	return join(resolveHarnessHome(void 0, env), "skins");
++/** Profile-local skin assets and selection must not affect another profile. */
++function userSkinsDir() {
++	const install = resolveInstallLayout();
++	const paths = resolveHarnessPaths(void 0, install?.profile);
++	return join(dirname(paths.profileManifestPath), "skins");
+ }
+ function readManifest(dir) {
+ 	const manifestPath = join(dir, "skin.json");
+@@ -4066,17 +4064,8 @@
+ 	} catch (error) {
+ 		console.error("[ui-skin-center] default-skin seed failed:", error);
+ 	}
+-	try {
+-		const statePath = defaultActiveStatePath();
+-		const migration = migrateLegacySelection({
+-			knownIds: loadSkinCatalog().skins.map((s) => s.manifest.id),
+-			activeStatePath: statePath
+-		});
+-		if (migration.failed) for (const note of migration.notes) console.error(`[ui-skin-center] legacy bridge: ${note}`);
+-		else if (migration.migrated !== null || migration.patchCleaned) for (const note of migration.notes) console.info(`[ui-skin-center] legacy bridge: ${note}`);
+-	} catch (error) {
+-		console.error("[ui-skin-center] legacy bridge failed:", error);
+-	}
++	// This profile shares DSH_HOME with desktop. Never migrate or rewrite the
++	// home/profile legacy skin patch automatically. Keep its bytes untouched.
+ }
+ //#endregion
+ export { Config, SKIN_BACKGROUND_NAMESPACE, SKIN_CENTER_V2_PREFIX, SKIN_CUSTOM_THEME_NAMESPACE, SkinBackgroundConfigSchema, SkinCssSafetyError, SkinCustomThemeConfigSchema, apply, auditTokenContract, builtinSkinsDir, canServeSkinHooks, defaultActiveStatePath, findSkin, inject, loadSkinCatalog, makeSkinCenterV2Routes, name, readActiveSelection, resolveInsideSkin, transformSkinCss, userSkinsDir, validateSkinManifestV2, writeActiveSelection };

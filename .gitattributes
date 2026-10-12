@@ -1,0 +1,4 @@
+# Keep version-specific patch bytes/hashes stable on Windows and Unix.
+# Unified-diff context lines intentionally start with a space before source tabs.
+patches/*.patch text eol=lf whitespace=-space-before-tab
+scripts/*.mjs text eol=lf
